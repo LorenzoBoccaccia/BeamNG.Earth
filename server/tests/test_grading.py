@@ -882,6 +882,45 @@ class OverTunnels(unittest.TestCase):
         self.assertIsNone(grading.Grader._over_tunnels(g, np.array([50.0]), np.array([30.0])))
 
 
+class RoadOverTunnelTest(unittest.TestCase):
+    """A road crossing over a covered tunnel keeps its own cutting over the tube; the tunnel's own road (its approaches)
+    still leaves the ground over the tube uncut. The stage road over the A25's twin tubes at Popoli (2026-11-14): its
+    cutting was undone in a strip over each tube, the hillside standing back up across the road."""
+
+    def setUp(self):
+        from test_roads import M_LON, M_LAT
+
+        def ground(la, lo):
+            e = (np.asarray(lo) - LON) * M_LON                          # along the tunnel, -500 .. 500
+            n = (np.asarray(la) - LAT) * M_LAT
+            hill = 100.0 + 60.0 * np.clip(1.0 - np.abs(e) / 400.0, 0.0, 1.0)
+            return hill + 6.0 * np.exp(-(n / 8.0) ** 2)                 # a bump on the line of the road across
+        self.ground = ground
+
+    def change(self, f, pts):
+        g = grading.Grader(FRAME, FakeMD(f), self.ground)
+        e = np.array([p[0] for p in pts], np.float64)
+        n = np.array([p[1] for p in pts], np.float64)
+        la, lo, _ = FRAME.enu_to_geodetic(e, n, 0.0)
+        base = self.ground(la, lo)
+        return g.apply(la, lo, base.copy()) - base
+
+    def tunnel(self, crossing=True):
+        lines = [[(-500, 0), (500, 0)]] + ([[(0, -150), (0, 150)]] if crossing else [])
+        return features(lines, ["primary", "secondary"][:len(lines)], flags=[(0, "is_tunnel", 0.25, 0.75)],
+                        ids=["tube", "across"][:len(lines)])
+
+    def test_the_road_across_keeps_its_cutting_over_the_tube(self):
+        d = self.change(self.tunnel(), [(0.0, 0.0), (0.0, 3.0)])
+        self.assertLess(float(d[0]), -2.0, "the bump under the road's centre cut away, as on any road")
+        self.assertLess(float(d[1]), -2.0, "... and under its lane edge")
+
+    def test_the_tunnels_own_road_does_not_cut_over_the_tube(self):
+        pts = [(x, y) for x in range(-240, 241, 20) for y in (-4.0, 0.0, 4.0)]
+        d = self.change(self.tunnel(crossing=False), pts)
+        self.assertGreater(float(d.min()), -grading.OVER_TUNNEL_SMALL_M, "the ground over the tube not cut down")
+
+
 class WallHeightTest(unittest.TestCase):
     def test_city_concrete_walls_full_height(self):
         """A major road's cutting in town keeps a full-height concrete wall (McGraw-Graben); stone walls elsewhere

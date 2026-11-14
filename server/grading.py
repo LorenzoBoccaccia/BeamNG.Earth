@@ -4306,9 +4306,45 @@ class _Planner:
         if keep is not None:
             # (a small change stays: a road over the tunnel lies on its own graded profile, the ground over the tunnel
             # left ungraded under it stood a few cm over the E6's lanes as patches of bare ground, GitHub #2)
-            keep &= np.abs(out - base.ravel()) >= OVER_TUNNEL_SMALL_M
-            out[keep] = base.ravel()[keep]
+            # (and a road over it that lies higher than the bare ground: only what would cut the cover down is undone;
+            # a street's smoothed profile 1 m over a dip in the ground over Vienna's A23 tunnel fell back to that dip
+            # in the strip over the tube, a ledge at each edge of it, 2026-11-12)
+            keep &= base.ravel() - out >= OVER_TUNNEL_SMALL_M
+            if keep.any():
+                # (what is undone there is the tunnels' own roads' grading, whose approaches reached up over the tube;
+                # a road crossing over it keeps its own cutting: undone too, the hillside stood back up across the road
+                # in a strip over each tube, the road's mesh on its profile up to 2.8 m off the ground and banks and
+                # pits beside it; the stage road over the A25's twin tubes at Popoli, 2026-11-14)
+                out[keep] = self._over_tunnel_ground(keys, e[keep], n[keep], base.ravel()[keep], lift)
         return out.reshape(shape)
+
+    def _over_tunnel_ground(self, keys, e, n, base, lift):
+        """base at the points over covered tunnels graded under the plans of the cells keys that are not a tunnel's
+        own road (its sections, mouths and approaches: the same feature as a TUNNEL_TAG plan), so a road crossing over
+        the tube keeps its grading there while the tunnel's approaches leave the ground over it as it is."""
+        mk = tuple(sorted(str(k) for k in keys))
+        memo = self.__dict__.setdefault("_over_sets", {})
+        with self.lock:
+            hit = memo.get(mk, False)
+        if hit is False:
+            cells = [self._cell_plans(k) for k in keys]
+            own = {fid.split(TUNNEL_TAG)[0] for ps in cells for fid, _p in ps if TUNNEL_TAG in fid}
+            got = {}
+            for ps in cells:
+                for fid, p in ps:
+                    if fid.split(TUNNEL_TAG)[0] not in own:
+                        got.setdefault((fid, float(p.xy[0, 0]), float(p.xy[0, 1])), p)
+            plans = [got[k] for k in sorted(got)]       # (in key order, as _plan_set: the same sums everywhere)
+            hit = PlanPack(plans) if plans else None
+            with self.lock:
+                if all(k in self.cells for k in keys):
+                    if len(memo) >= PLAN_SETS_MAX:
+                        memo.pop(next(iter(memo)))
+                    memo[mk] = hit
+        if hit is None:
+            return base
+        # (never above the bare ground: only what would cut the cover down is undone here, and it stays a cut)
+        return np.minimum(grade_points(e, n, base, hit, lift), base)
 
     def open_tunnels(self, lat, lon):
         """[(lat (k,), lon (k,), Spec)] of the tunnels' open sections planned near the points: roads on the ground
