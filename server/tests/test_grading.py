@@ -916,9 +916,17 @@ class RoadOverTunnelTest(unittest.TestCase):
         self.assertLess(float(d[1]), -2.0, "... and under its lane edge")
 
     def test_the_tunnels_own_road_does_not_cut_over_the_tube(self):
-        pts = [(x, y) for x in range(-240, 241, 20) for y in (-4.0, 0.0, 4.0)]
+        # (every 2 m: the approach's cutting reached ~6 m in over the cover, between samples 20 m apart)
+        pts = [(x, y) for x in range(-246, 247, 2) for y in (-4.0, 0.0, 4.0)]
         d = self.change(self.tunnel(crossing=False), pts)
         self.assertGreater(float(d.min()), -grading.OVER_TUNNEL_SMALL_M, "the ground over the tube not cut down")
+
+
+    def test_a_tunnel_plans_feature(self):
+        # (a tunnel's plans are named for its sections, the map part's id (roads: f"{fid}.{n}") then "#k")
+        self.assertEqual(grading._tunnel_feature("35f45a70-54b2.9398624#1:tunm1"), "35f45a70-54b2")
+        self.assertEqual(grading._tunnel_feature("eeb16a87.0#0:tun"), "eeb16a87")
+        self.assertEqual(grading._tunnel_feature("tube"), "tube")
 
 
 class WallHeightTest(unittest.TestCase):
