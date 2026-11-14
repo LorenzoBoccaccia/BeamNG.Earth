@@ -26,6 +26,7 @@ GradedDem(dem, grader) is a drop-in for dem.Dem where only sample() is graded; u
 and the levels <= 0 tiles only (coarser tiles sink under the block and cover far more ground).
 """
 from runtimeprofiler import step as profile_step
+import copy
 import logging
 import math
 import os
@@ -157,6 +158,7 @@ TUNNEL_KEEP_M = 5.0         # m beside a covered tunnel's road where the ground 
 PORTAL_REACH_M = 30.0       # m: the cells this near a tunnel's portal grade it (apply roads_only)
 TUNNEL_OWN_MARGIN_M = 30.0  # m round a cell's box: the tunnel parts reaching into it are its plans' (_tunnel_sections)
 OVER_TUNNEL_SMALL_M = 0.5   # ... but for a change smaller than this (a road crossing over it, graded flush)
+OVER_TUNNEL_APPROACH_M = 1.0  # m: a road ending this near a tunnel's plan's end is its approach (_over_tunnel_ground)
 WALL_AHEAD_M = 2.5          # ... only beside a segment or this little past its end (a joint between two: VERTEX_STEP)
 YIELD_RAMP_M = 0.5          # m over which a road gives way to another's carriageway at another level (grade_points): in
                             # height difference up to WALL_CUT_M and in distance past its own carriageway's edge
@@ -194,6 +196,16 @@ RETRY_S = 60.0              # s before a cell whose road data failed is asked fo
 # block only when every cell whose plans can reach it is known complete: plans made short and kept in memory for the
 # session raise no fault when a later block reads them.
 _PLANS_COMPLETE = {}
+
+
+def _tunnel_feature(fid):
+    """The map feature of plan fid: a tunnel's plans are named for its sections, "<fid>.<n>#<k>" + TUNNEL_TAG (the map
+    part, roads.TunnelProfiles._part_id, then the section), a road's for the feature itself."""
+    fid = str(fid)
+    if TUNNEL_TAG not in fid:
+        return fid
+    part = fid.split(TUNNEL_TAG)[0].rsplit("#", 1)[0]
+    return part.rsplit(".", 1)[0]
 
 
 def _note_plans(key, complete):
@@ -6461,8 +6473,60 @@ class _Planner:
             # a street's smoothed profile 1 m over a dip in the ground over Vienna's A23 tunnel fell back to that dip
             # in the strip over the tube, a ledge at each edge of it, 2026-11-12)
             keep &= base.ravel() - out >= OVER_TUNNEL_SMALL_M
-            out[keep] = base.ravel()[keep]
+            if keep.any():
+                # (what is undone there is the tunnels' own roads' grading, whose approaches reached up over the tube;
+                # a road crossing over it keeps its own cutting: undone too, the hillside stood back up across the road
+                # in a strip over each tube, the road's mesh on its profile up to 2.8 m off the ground and banks and
+                # pits beside it; the stage road over the A25's twin tubes at Popoli, 2026-11-14)
+                # (never below the full grading: what the other roads cut stays as it is, what the tunnel's own plans
+                # cut beyond it is undone; the full grading where the other roads cut deeper, so no ledge where a
+                # point's cut reaches OVER_TUNNEL_SMALL_M: a trunk's wheel track over the Peripherique's tube at
+                # Porte Maillot stepped 2.5 m there from its full grading to the other roads', test_drivability)
+                out[keep] = np.maximum(out[keep], self._over_tunnel_ground(keys, e[keep], n[keep], base.ravel()[keep],
+                                                                          lift))
         return out.reshape(shape)
+
+    def _over_tunnel_ground(self, keys, e, n, base, lift):
+        """base at the points over covered tunnels graded under the plans of the cells keys that are not a tunnel's
+        own road (its sections, mouths and approaches: the same feature as a TUNNEL_TAG plan, or a road that ends at
+        one's end, OVER_TUNNEL_APPROACH_M), so a road crossing over the tube keeps its grading there while the tunnel's
+        approaches leave the ground over it as it is."""
+        mk = tuple(sorted(str(k) for k in keys))
+        memo = self.__dict__.setdefault("_over_sets", {})
+        with self.lock:
+            hit = memo.get(mk, False)
+        if hit is False:
+            cells = [self._cell_plans(k) for k in keys]
+            own = {_tunnel_feature(fid) for ps in cells for fid, _p in ps if TUNNEL_TAG in fid}
+            ends = [np.asarray(p.xy)[[0, -1], :2] for ps in cells for fid, p in ps if TUNNEL_TAG in fid]
+            if ends:
+                # (an approach mapped as a way of its own, ending at the portal: the Peripherique's trunk into its tube
+                # at Porte Maillot, its descent cutting the ground over the tube under Avenue de Neuilly)
+                ends = np.vstack(ends)
+                for ps in cells:
+                    for fid, p in ps:
+                        if TUNNEL_TAG not in fid and fid not in own:
+                            xy = np.asarray(p.xy)[[0, -1], :2]
+                            d = dnp.hypot(xy[:, None, 0] - ends[None, :, 0], xy[:, None, 1] - ends[None, :, 1])
+                            if d.min() <= OVER_TUNNEL_APPROACH_M:
+                                own.add(fid)
+            got = {}
+            for ps in cells:
+                for fid, p in ps:
+                    if _tunnel_feature(fid) not in own:
+                        got.setdefault((fid, float(p.xy[0, 0]), float(p.xy[0, 1])), p)
+            plans = [got[k] for k in sorted(got)]       # (in key order and merged, as _plan_set: the same sums everywhere)
+            # (copies: the merge welds and trims its plans in place, and these are the cells' own)
+            hit = merge_plan_set(copy.deepcopy(plans)) if plans else None
+            with self.lock:
+                if all(k in self.cells for k in keys):
+                    if len(memo) >= PLAN_SETS_MAX:
+                        memo.pop(next(iter(memo)))
+                    memo[mk] = hit
+        if hit is None:
+            return base
+        # (never above the bare ground: only what would cut the cover down is undone here, and it stays a cut)
+        return np.minimum(grade_points(e, n, base, hit, lift), base)
 
     def open_tunnels(self, lat, lon):
         """[(lat (k,), lon (k,), Spec)] of the tunnels' open sections planned near the points: roads on the ground
