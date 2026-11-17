@@ -575,6 +575,15 @@ UNDER_TUNNEL_FIXED_ON = os.environ.get("BNE_UNDERPASS_TUNNEL_FIXED", "on") != "o
 # ramps for those bridges (a motorway's too); the rules above decide for every other.
 import crossings as _xs
 import carriageways as _cw
+import gradesystems as _gs
+# Grade-separation systems solved as a whole (gradesystems.py): every road and rail part one set of decks and underpasses
+# ties together, with the lead-up roads to where they reach the ground at their grade, in one problem; its heights
+# replace the passes' within it. Off by default: BNE_SYSTEMS=1.
+GS_ON = os.environ.get("BNE_SYSTEMS", "0").strip().lower() in ("1", "on", "yes", "true")
+GS_PADS_M = (400.0, 1200.0, 2400.0)     # m round a cell the members are read from, wider until its systems are closed
+GS_NEAR_M = 3.0                         # m: a plan vertex this near a system's profile of its road takes its height
+_GS_SOLVED = {}                         # system key -> its profiles (one solve per process, whichever cell found it)
+_GS_LOCK = threading.Lock()
 CW_ON = _xs.ON and os.environ.get("BNE_CARRIAGEWAYS", "on") != "off"          # carriageways.py: a motorway's roads and decks as one profile (with BNE_INTERCHANGE)
 CW_MAX_M = 8000.0       # m: a carriageway chain is cut here (a branch point or a loose end comes long before)
 CW_HEADROOM_M = roadsmod.MIN_BRIDGE_HEADROOM_M + roadsmod.BRIDGE_HEADROOM_MARGIN_M   # m of headroom the carriageways
@@ -2899,6 +2908,13 @@ class _Planner:
                 except Exception as e:      # the welded heights alone rather than no grading
                     _caught(e)
                     log.debug("grading: junctions after welding of %s: %s: %s", key, type(e).__name__, e)
+            if GS_ON and plans:
+                try:            # the grade-separation systems' heights, then the side roads meet them again
+                    if self._apply_systems(plans, pspecs) and JUNCTION_SNAP_ON:
+                        snap_junctions([p for _f, p in plans], pspecs)
+                except Exception as e:      # the passes' heights rather than no grading
+                    _caught(e)
+                    log.warning("grading: systems of %s: %s: %s", key, type(e).__name__, e)
             if plans:
                 try:            # a pass road's widened hairpins (roads.HAIRPIN_*): its core wider round each
                     hairpin_cores(plans, pspecs, self.frame)
@@ -4302,6 +4318,246 @@ class _Planner:
     # ---- carriageways (carriageways.py): a motorway's roads and decks as one profile ----
 
     @_marked("_cw_cells", lambda self, k: str(k))
+    def _gs_cell_members(self, k):
+        """Cell k's roads and tracks as gradesystems members: its ground roads, road decks, short road tunnels, track on
+        the ground and rail decks (frame ENU), keyed the same from every cell."""
+        c = self._cell_enu(k)
+        out = []
+        for (line, half, cls), gid in zip(c["ground"], c.get("ground_ids", [])):
+            line = np.asarray(line, np.float64)[:, :2]
+            out.append(_gs.Member((str(gid[0]), "ground", str(gid[1])), line, "ground", cls, None, 0.0, float(half), None))
+        nb = len(c["bridges"])
+        for line, cls, fid, lv, h in zip(c["bridges"], c.get("bridge_cls", [None] * nb), c.get("bridge_ids", [None] * nb),
+                                         c.get("bridge_levels", [1.0] * nb), c.get("bridge_half", [4.0] * nb)):
+            line = np.asarray(line, np.float64)[:, :2]
+            mid = line[len(line) // 2]
+            out.append(_gs.Member((str(fid), "deck", int(round(mid[0])), int(round(mid[1]))), line, "deck", cls or "road",
+                                  None, float(lv), float(h), None))
+        for kind, lines in (("rail", c.get("rail_ground", ())), ("rail_deck", c.get("rail_bridges", ()))):
+            for line in lines:
+                line = np.asarray(line, np.float64)[:, :2]
+                if len(line) < 2:
+                    continue
+                key = ("rail", kind) + tuple(int(round(v)) for v in (line[0][0], line[0][1], line[-1][0], line[-1][1]))
+                out.append(_gs.Member(key, line, kind, "rail", None, 1.0, 2.0, None))
+        out += self._gs_tunnels(k)
+        return out
+
+    def _gs_tunnels(self, k):
+        """Cell k's road tunnel parts as gradesystems members (an underpass is a short one), made once per cell."""
+        memo = self.__dict__.setdefault("_gs_tun_memo", {})
+        with self.lock:
+            got = memo.get(str(k))
+        if got is not None:
+            return got
+        out = []
+        f = self.md.cell(k, layers=("roads",), kind="demand").layers.get("roads")
+        if f is not None and len(f):
+            rs = roadsmod.road_specs(f, None, self.widths)
+            for i in range(len(f)):
+                if rs[i] is None:
+                    continue
+                for ring in roadsmod.tunnel_parts(f, i):
+                    ring = np.asarray(ring, np.float64)
+                    if len(ring) < 2:
+                        continue
+                    e, n_, _ = self.frame.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.0)
+                    line = np.stack([np.asarray(e, np.float64), np.asarray(n_, np.float64)], axis=1)
+                    mid = line[len(line) // 2]
+                    out.append(_gs.Member((str(f.ids[i]), "tunnel", int(round(mid[0])), int(round(mid[1]))), line,
+                                          "tunnel", rs[i].cls + ("_link" if _is_link(rs[i]) else ""), rs[i].kmh, -1.0,
+                                          float(rs[i].width) / 2, None))
+        with self.lock:
+            if len(memo) > 256:
+                memo.clear()
+            memo[str(k)] = out
+        return out
+
+    def _gs_region(self, home):
+        """Cell home's systems' profiles: {road feature id: [(xy (m, 2), z (m,), kind, edge at start, edge at end)]},
+        every system that reaches the cell, found from the cells round it (wider until each is closed), each solved once
+        per process."""
+        memo = self.__dict__.setdefault("_gs_regions", {})
+        hk = str(home)
+        with self.lock:
+            got = memo.get(hk)
+        if got is not None:
+            return got
+        got = self._gs_region_calc(home, hk)
+        with self.lock:
+            if len(memo) > 64:
+                memo.clear()
+            memo[hk] = got
+        return got
+
+    def _gs_region_calc(self, home, hk):
+        t0 = time.perf_counter()
+        lon0, lat0, lon1, lat1 = (float(v) for v in home.bounds())
+        ce, cn, _ = self.frame.geodetic_to_enu(np.array([lat0, lat0, lat1, lat1]), np.array([lon0, lon1, lon0, lon1]),
+                                               0.0)
+        h_lo = np.array([np.min(ce), np.min(cn)])
+        h_hi = np.array([np.max(ce), np.max(cn)])
+        mid_la = (lat0 + lat1) / 2
+        members, mine, pad = [], [], 0.0
+        for pad in GS_PADS_M:
+            pla = pad / 111320.0
+            plo = pla / max(0.05, dmath.cos(math.radians(mid_la)))
+            keys = sorted(set(mapcells.cells_for_bbox(lat0 - pla, lon0 - plo, lat1 + pla, lon1 + plo)), key=str)
+            byk = {}
+            for k in keys:
+                for m in self._gs_cell_members(k):
+                    old = byk.get(m.key)
+                    if old is None or len(m.line) > len(old.line):
+                        byk[m.key] = m
+            lo_, hi_ = h_lo - pad, h_hi + pad
+            members = [byk[q] for q in sorted(byk, key=str)
+                       if ((byk[q].line >= lo_) & (byk[q].line <= hi_)).all(1).any()]
+            systems = _gs.find_systems(members)
+            mine, closed = [], True
+            for sysm in systems:
+                pts = np.concatenate([p_[2] for p_ in _gs.sample(members, sysm)])    # (the ranges in it, not the lines)
+                b_lo, b_hi = pts.min(0), pts.max(0)
+                if (b_hi < h_lo).any() or (b_lo > h_hi).any():
+                    continue
+                mine.append(sysm)
+                if (b_lo < h_lo - pad + 50.0).any() or (b_hi > h_hi + pad - 50.0).any():
+                    closed = False
+            if closed:
+                break
+        t1 = time.perf_counter()
+        prof, n_s, solved = {}, 0, 0
+        for sysm in mine:
+            key = _gs.system_key(members, sysm)
+            with _GS_LOCK:
+                res = _GS_SOLVED.get(key)
+            if res is None:
+                res = self._gs_solve(members, sysm)
+                solved += 1
+                with _GS_LOCK:
+                    if len(_GS_SOLVED) > 512:
+                        _GS_SOLVED.clear()
+                    _GS_SOLVED[key] = res
+            for fid, item in res:
+                prof.setdefault(fid, []).append(item)
+                n_s += len(item[1])
+        log.warning("grading: GSTIME pid %d region %s: pad %.0f m, %d members, %d systems (%d solved here), %d samples, "
+                    "find %.2f s, solve %.2f s", os.getpid(), hk, pad, len(members), len(mine), solved, n_s, t1 - t0,
+                    time.perf_counter() - t1)
+        return prof
+
+    def _gs_solve(self, members, sysm):
+        """One system's profiles: [(road feature id, (xy, z, kind, edge at start, edge at end))]."""
+        f64 = np.float64
+        pieces = _gs.sample(members, sysm)
+        allxy = np.concatenate([p[2] for p in pieces])
+        la, lo, _ = self.frame.enu_to_geodetic(allxy[:, 0], allxy[:, 1], 0.0)
+        raw = np.asarray(self.elev(np.asarray(la, f64), np.asarray(lo, f64)), f64).ravel()
+        ok = np.isfinite(raw)
+        if not ok.any():
+            raw = np.zeros(len(raw))
+        elif not ok.all():
+            raw = np.interp(np.arange(len(raw)), np.flatnonzero(ok), raw[ok])
+        ground, edges, k0 = [], [], 0
+        ends = {}
+        for i, si, j, sj in sysm["joins"]:
+            ends.setdefault(i, []).append(si)
+            ends.setdefault(j, []).append(sj)
+        for i, r, xy, sv in pieces:
+            t = raw[k0:k0 + len(sv)]
+            k0 += len(sv)
+            m = members[i]
+            if m.kind in ("ground", "tunnel", "rail") and len(t) >= 5:
+                t = smooth_profile(median_profile(t, _gs.STEP_M, 12.0), _gs.STEP_M, 6.0)
+            ground.append(np.asarray(t, f64))
+            L = float(_gs._arclen(np.asarray(m.line, f64)[:, :2])[-1])
+            if m.kind in ("deck", "rail_deck"):         # (an abutment no other member meets: on its ground)
+                js = ends.get(i, [])
+                edges.append((not any(abs(s_) <= _gs.JOIN_M for s_ in js),
+                              not any(abs(s_ - L) <= _gs.JOIN_M for s_ in js)))
+            else:
+                edges.append((sv[0] > 0.5, sv[-1] < L - 0.5))
+        zs = _gs.solve(members, sysm, pieces, ground, edges)
+        out = []
+        for (i, r, xy, sv), z, e in zip(pieces, zs, edges):
+            m = members[i]
+            if m.kind in ("rail", "rail_deck"):
+                continue                # (the track's bed is the railways' own: here only what it asks of the roads)
+            out.append((str(m.key[0]), (xy, np.asarray(z, f64), m.kind, bool(e[0]) and m.kind != "deck",
+                                        bool(e[1]) and m.kind != "deck")))
+        return out
+
+    def _gs_z_at(self, line, pts, fid, kinds=None):
+        """Heights of points pts on road fid's line from its systems' profiles, and their weight (1 inside a system,
+        easing to 0 over EDGE_BLEND_M toward a system's edge): (z, w), NaN / 0 off every profile; None with none."""
+        line = np.asarray(line, np.float64)[:, :2]
+        mid = line[len(line) // 2]
+        la, lo, _ = self.frame.enu_to_geodetic(np.array([mid[0]]), np.array([mid[1]]), 0.0)
+        try:
+            reg = self._gs_region(mapcells.cell_of(float(la[0]), float(lo[0])))
+        except Exception as e:      # (the passes' heights)
+            _caught(e)
+            log.warning("grading: systems at %s: %s: %s", np.round(mid, 1), type(e).__name__, e)
+            return None
+        items = [it for it in reg.get(str(fid), ()) if kinds is None or it[2] in kinds]
+        if not items:
+            return None
+        pts = np.asarray(pts, np.float64).reshape(-1, 2)
+        zout = np.full(len(pts), np.nan)
+        wout = np.zeros(len(pts))
+        dbest = np.full(len(pts), np.inf)
+        for xy, z, kind, e0, e1 in items:
+            s = _gs._arclen(xy)
+            a, b = xy[:-1], xy[1:]
+            ab = b - a
+            L2 = np.maximum((ab * ab).sum(1), 1e-12)
+            for n, q in enumerate(pts):
+                t = np.clip(((q - a) * ab).sum(1) / L2, 0.0, 1.0)
+                d = dnp.hypot(*(a + t[:, None] * ab - q).T)
+                j = int(np.argmin(d))
+                if d[j] > GS_NEAR_M or d[j] >= dbest[n]:
+                    continue
+                sq = s[j] + t[j] * (s[j + 1] - s[j])
+                w = 1.0
+                if e0:
+                    w = min(w, sq / _gs.EDGE_BLEND_M)
+                if e1:
+                    w = min(w, (s[-1] - sq) / _gs.EDGE_BLEND_M)
+                w = float(np.clip(w, 0.0, 1.0))
+                dbest[n] = d[j]
+                zout[n] = z[j] + (z[j + 1] - z[j]) * t[j]
+                wout[n] = w * w * (3.0 - 2.0 * w)
+        return zout, wout
+
+    def _apply_systems(self, plans, specs):
+        """GS_ON: each plan within a system takes its profile there (eased in from the system's edges); whether any
+        changed."""
+        done = False
+        for n, ((fid, p), sp) in enumerate(zip(plans, specs)):
+            if sp is None:
+                continue
+            xy = np.asarray(p.xy, np.float64)[:, :2]
+            if len(xy) < 2:
+                continue
+            got = self._gs_z_at(xy, xy, str(fid).split(":")[0], ("ground", "tunnel"))
+            if got is None:
+                continue
+            zs, w = got
+            ok = np.isfinite(zs) & (w > 0)
+            if not ok.any():
+                continue
+            z = np.array(p.z, np.float64)
+            z[ok] = z[ok] + w[ok] * (zs[ok] - z[ok])
+            np_ = Plan(p.xy, z, p.half, p.abut, p.cut, p.road_half)
+            np_.rid, np_.max_wall, np_.bank = p.rid, p.max_wall, getattr(p, "bank", None)
+            np_.rank = getattr(p, "rank", GRADE_RANK_NONE)
+            np_.steep = getattr(p, "steep", False)
+            for a_ in ("tunnel_section", "open_tunnel"):
+                if hasattr(p, a_):
+                    setattr(np_, a_, getattr(p, a_))
+            plans[n] = (fid, np_)
+            done = True
+        return done
+
     def _cw_cell_parts(self, k):
         """Cell k's parts of the motorway and trunk families: [(key, line (n, 2), is_bridge, cls, feature id, level,
         half width)], each once (level: a bridge's OSM layer, 1 without one; 0 on the ground)."""
@@ -6919,7 +7175,11 @@ def _deck_z_hook(frame, lines, fids=None):
         pl, _idx = store.planners_of(la[len(la) // 2:len(la) // 2 + 1], lo[len(lo) // 2:len(lo) // 2 + 1])[0]
         e, n, _ = pl.frame.geodetic_to_enu(la, lo, 0.0)
         xy = np.stack([np.asarray(e, np.float64), np.asarray(n, np.float64)], axis=1)
-        z = pl._cw_z_at(xy, xy, fid)
+        if GS_ON:
+            got = pl._gs_z_at(xy, xy, fid, ("deck",)) if fid is not None else None
+            z = got[0] if got is not None and np.isfinite(got[0]).all() else None
+        else:
+            z = pl._cw_z_at(xy, xy, fid)
         if z is None:
             out.append(None)
             continue
@@ -6927,7 +7187,7 @@ def _deck_z_hook(frame, lines, fids=None):
     return out if any(o is not None for o in out) else None
 
 
-if CW_ON:
+if CW_ON or GS_ON:
     roadsmod.DECK_Z_HOOK = _deck_z_hook
 
 
