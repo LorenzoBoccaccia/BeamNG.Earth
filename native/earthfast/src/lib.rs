@@ -1,5 +1,10 @@
 //! Geometry kernels for the world server (server/fast.py wraps them, with the Python versions as the fallback).
 //! All coordinates are metres in the anchor's local frame, f64.
+// Determinism (the Rust port plan's section 2.6; native/earthfast/clippy.toml lists the methods and types): no platform
+// maths (dm::Dm instead), no powi / mul_add, no std HashMap / HashSet iteration order into an output, no std hasher
+// whose keys vary per process or per Rust release. A site that needs one anyway carries a narrow #[allow(...)] with its
+// reason; `cargo clippy` fails on a new one.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types, clippy::iter_over_hash_type)]
 use crate::dm::Dm;
 mod dm;
 mod devctx;
@@ -116,6 +121,9 @@ mod par;
 mod bc1fast;
 mod l0roads;
 mod groundphoto;
+mod genground;
+mod ggshapes;
+mod ggshade;
 mod layerfold;
 mod roadsurf;
 mod levelways;
@@ -5651,7 +5659,7 @@ fn wet_run_inside(xy: PyReadonlyArray2<f64>, wet: PyReadonlyArray1<bool>) -> PyR
     }
     let mut s = vec![0.0f64; n];
     for i in 1..n {
-        s[i] = s[i - 1] + ((p[[i, 0]] - p[[i - 1, 0]]).powi(2) + (p[[i, 1]] - p[[i - 1, 1]]).powi(2)).sqrt();
+        s[i] = s[i - 1] + ((p[[i, 0]] - p[[i - 1, 0]]).sq() + (p[[i, 1]] - p[[i - 1, 1]]).sq()).sqrt();
     }
     let (mut best, mut i) = (0.0f64, 0usize);
     while i < n {
@@ -5915,6 +5923,7 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decks::deck_beside, m)?)?;
     m.add_function(wrap_pyfunction!(decks::deck_end_joins, m)?)?;
     m.add_function(wrap_pyfunction!(tapers::road_tapers, m)?)?;
+    m.add_function(wrap_pyfunction!(tapers::taper_widths_along, m)?)?;
     m.add_function(wrap_pyfunction!(tapers::lane_flow, m)?)?;
     m.add_function(wrap_pyfunction!(roadlanes::generated_lanes, m)?)?;
     m.add_function(wrap_pyfunction!(roadlanes::lane_flow_cells, m)?)?;
@@ -6462,6 +6471,40 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     farsel::register(m)?;
     // (304 also) far_select_nodes and far_global_select return the selection's slack (the move under which it stays the
     // same: earthd's selection gate skips only selections that could not change)
-    m.add("VERSION", 304)?;
+    // 305: pmt_find_many / pmt_ranges (Mapterhorn's regional elevation archives read by range reads instead of its
+    // tile endpoint: server/mtarchive.py)
+    m.add_function(wrap_pyfunction!(pmtiles::pmt_find_many, m)?)?;
+    m.add_function(wrap_pyfunction!(pmtiles::pmt_ranges, m)?)?;
+    // 306: genground::gg_fill_polys / gg_regions / gen_ground (the generated ground, BNE_GEN_GROUND: a block's 1 m base
+    // colour from Sentinel-2 and the map's regions instead of a 1 m aerial photo; server/genground.py)
+    genground::register(m)?;
+    // 307: gen_ground(..., gr, gc): its sampling lattices on the global texel grid, the caller's square with a halo
+    // (Codex review of 306: overlapping blocks drew the same ground in other colours)
+    // 308: generated ground stage 2: gg_regions(..., line, line_kind, ...) and the surface / pattern kinds,
+    // gen_ground(..., poly, pdir, pphase, ...), ggshapes::gg_fill_lines / gg_poly_axes
+    ggshapes::register(m)?;
+    ggshade::register(m)?;
+    // 309: gg_poly_axes(..., skip): linear (a histogram of the edge directions), all of a polygon's rings, clip edges left
+    // out (Codex review of 308)
+    // 310: stage 3 perf: gg_grid (the texel grid and its Web-Mercator metres, rectangles), the edge-table polygon fill,
+    // the capsule-interval line fill, value_noises on the kernels' threads (all the same output)
+    // 311: stage 3 steps 2-3: gg_regions(..., t) with the bounded hedgerow skirt; gen_ground's field-edge barriers and
+    // forest floor
+    // 312: stage 3 steps 4-5: unmapped crop's furrows where the photo shows periodic strips (a structure tensor on the 8 m
+    // cells, 32 integer normals, a lag test), the surfaces' palette by the support of their photo colour
+    // 320: veg_clumps(..., segs, hws, grid, merc_per_m, rad, max_shift_m) -> (..., stats): the far clumps kept off the
+    // carriageways (split at a road, moved off it, else their trees single). (313-319 left for the parallel ground
+    // work's bumps)
+    // 321: veg_clumps(..., own, blocked): a clump moved off a road stays in its map cell and off buildings / water
+    // (Codex review of 320)
+    // 313: stage 4: gg_discs (where the game's trees stand), gg_regions(..., floor, skirt), gen_ground(..., floor,
+    // floor_mode): the forest floor follows the placed trees
+    // 314: stage 5: ggshade (gg_sun_fit, gg_relight: the capture sun's shadows out of the Sentinel-2 colour);
+    // gen_ground's LOST texels, its crowns' shading from no direction
+    // 322: both of the above merged (321 vegetation clumps + 313/314 generated ground stages 4-5)
+    // 370: genground::gen_ground_pair(..., floor_mode, gaps) (the ground and its canopy version in one pass: the far
+    // rings' and the block's forest floor fade through the mips, byte for byte two gen_ground calls; gaps: the block's
+    // unplaced gaps in the photo's colour in the canopy version too)
+    m.add("VERSION", 370)?;
     Ok(())
 }

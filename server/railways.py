@@ -71,6 +71,18 @@ TILE_VERTS_MAX = 150000     # a tile's whole track (past it the tracks of lowest
 SPLIT_CHUNK_TRIS = 2000     # triangles taken into a shape at a time
 BALLAST = "bne_rail_ballast"
 FOOTBRIDGES_ON = os.environ.get("BNE_FOOTBRIDGES", "on") != "off"     # (footbridges.py)
+# A walkway bridge tested against every carriageway it crosses (the road revamp's R1, 2026-11-16): tile_mesh handed
+# footbridges.add the rail's crossers, which true_crossers cuts to the roads crossing a railway at grade wherever a
+# line is near, so a footbridge over a motorway near a railway saw no road under it and its slab stood 0.5-1.9 m over
+# the lanes (Brisbane's Ipswich Motorway, a 72 m footway over a secondary road near Hofheim). With BNE_FOOT_CLEAR=on it
+# gets every carriageway (and tunnel) near the tile: one that cannot clear them is left out, as footbridges.py
+# intends. Off by default until reviewed in game.
+FOOT_CLEAR = os.environ.get("BNE_FOOT_CLEAR", "off") == "on"
+# Worn railways (disused, abandoned; OSM railway=historic not drawn) cut at every road they cross on the ground (the
+# road revamp's R1, plan §2.2 LIFE; 1.9.0 cut them at motorways and, abandoned, trunk roads only: complaints of old
+# lines across country roads in South Wales, Rheinland-Pfalz, Indiana). BNE_RAIL_LIFECYCLE=on; off by default until
+# reviewed in game (a disused street track, as Fells Point's trolley lines, then stops at every street it crosses).
+RAIL_LIFECYCLE = os.environ.get("BNE_RAIL_LIFECYCLE", "off") == "on"
 CONCRETE = "bne_bridge_concrete"    # (roadmesh.DECK_SIDE: the decks and piers)
 SLEEPER = "bne_rail_sleeper"        # weathered concrete sleepers (bne_bridge_concrete stood out near-white, 2026-10-25)
 COLLIDER = "bne_rail_collider"    # a rail's physics-only box (never drawn): the inner face a flange rides along, tile_mesh
@@ -609,39 +621,56 @@ def _coarse_here(frame, box):
         return False
 
 
+SEG_HITS_PAIRS = 1 << 18    # segment pairs _seg_hits tests at once (its arrays stay a few MB whatever the lines)
+
+
 def _seg_hits(a, b):
-    """Arc positions along polyline a where it crosses polyline b (proper segment intersections). Pure."""
+    """Arc positions along polyline a where it crosses polyline b (proper segment intersections). Every segment of b
+    at once per run of a's segments, the hits in the order the loop over both gave them (a's segment, then b's), the
+    same products per pair. Pure."""
+    n, m = len(a) - 1, len(b) - 1
+    if n < 1 or m < 1:
+        return []
     out = []
     sa = _arc(a)
-    for i in range(len(a) - 1):
-        p, r = a[i], a[i + 1] - a[i]
-        for j in range(len(b) - 1):
-            q, t = b[j], b[j + 1] - b[j]
-            den = r[0] * t[1] - r[1] * t[0]
-            if abs(den) < 1e-12:
-                continue
-            u = ((q[0] - p[0]) * t[1] - (q[1] - p[1]) * t[0]) / den
-            v = ((q[0] - p[0]) * r[1] - (q[1] - p[1]) * r[0]) / den
-            if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
-                out.append(float(sa[i] + u * (sa[i + 1] - sa[i])))
+    q, t = b[:-1], b[1:] - b[:-1]
+    rows = max(1, SEG_HITS_PAIRS // m)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for i0 in range(0, n, rows):
+            i1 = min(i0 + rows, n)
+            p, r = a[i0:i1], a[i0 + 1:i1 + 1] - a[i0:i1]
+            den = r[:, None, 0] * t[None, :, 1] - r[:, None, 1] * t[None, :, 0]
+            d0, d1 = q[None, :, 0] - p[:, None, 0], q[None, :, 1] - p[:, None, 1]
+            u = (d0 * t[None, :, 1] - d1 * t[None, :, 0]) / den
+            v = (d0 * r[:, None, 1] - d1 * r[:, None, 0]) / den
+            i, j = np.nonzero((np.abs(den) >= 1e-12) & (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0))
+            out.extend(float(x) for x in sa[i0 + i] + u[i, j] * (sa[i0 + i + 1] - sa[i0 + i]))
     return out
 
 
 def coarse_underpasses(frame, cells, box, rails, reach=REACH_M):
     """[(xy, half width)] (as road_underpasses): on coarse elevation (COARSE_AT), each ground road's piece
     COARSE_PIECE_M either side of where a rail bridge part crosses it."""
-    bridges = [xy for (_fid, _c, kind, xy) in rails if kind == "bridge" and len(xy) >= 2]
+    bridges = [r for r in rails if r[2] == "bridge" and len(r[3]) >= 2]
     if not bridges:
         return []
     coarse = _coarse_here(frame, box)
     if not coarse and not (FLAT_SEP_ON and RAW_ELEV is not None):
         return []
     out = []
+    boxes = _rail_boxes(bridges)
     for line, half in crossings(frame, cells, box, reach):
         if len(line) < 2:
             continue
+        # (only the bridge parts whose box meets the road's can cross it: every road against every part's every
+        # segment was 1.5e9 segment pairs for one plan in Hong Kong (22.414 N 114.213 E), which never finished)
+        lo, hi = line.min(0), line.max(0)
+        near = np.flatnonzero((boxes[:, 0] <= hi[0]) & (boxes[:, 2] >= lo[0])
+                              & (boxes[:, 1] <= hi[1]) & (boxes[:, 3] >= lo[1]))
+        if not len(near):
+            continue
         sl = _arc(line)
-        for b in bridges:
+        for b in (bridges[k][3] for k in near):
             for sc in _seg_hits(line, b):
                 if not coarse and not flat_rail_crossing(frame, b, line, sc):
                     continue
@@ -881,6 +910,8 @@ def drawn(feats, i, bridges=False):
 OSM_RAILWAY_WEAR = {"rail": 0, "light_rail": 0, "narrow_gauge": 0, "preserved": 0, "disused": 1, "abandoned": 2}
 OSM_RAILWAY_NOT = {"proposed", "construction", "razed", "dismantled", "planned", "subway", "tram", "monorail",
                    "funicular", "miniature", "platform"}
+if RAIL_LIFECYCLE:                  # (a historic route: nothing of it left to draw)
+    OSM_RAILWAY_NOT = OSM_RAILWAY_NOT | {"historic"}
 
 
 def osm_gauge(feats, i):
@@ -1022,6 +1053,8 @@ def crosses(a, b, min_sin=WALK_MIN_SIN):
 # still have its rails).
 WORN_CUT_M = 6.0
 WORN_CUT_CLASSES = {1: {"motorway"}, 2: {"motorway", "trunk"}}
+if RAIL_LIFECYCLE:                  # (every road class: roads.STYLE's)
+    WORN_CUT_CLASSES = {1: frozenset(roads.STYLE), 2: frozenset(roads.STYLE)}
 WORN_CUT_MIN_SIN = 0.2      # (a crossing flatter than this cuts as if at this angle: the cut stays bounded)
 
 
@@ -1034,6 +1067,9 @@ def motorway_crossings(frame, cells, box, reach=REACH_M):
             continue
         clss = feats.attrs["class"]
         big = _is(clss, ("motorway", "trunk", "motorway_link", "trunk_link"))
+        if RAIL_LIFECYCLE:              # (every road: worn lines are cut at all of them)
+            sub = feats.attrs.get("subtype")
+            big = np.ones(len(feats), bool) if sub is None else _is(sub, ("road",))
         if not big.any():
             continue
         for i in _box_hits(feats.boxes(frame), near, big):
@@ -2561,6 +2597,15 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
         for line, hw in cr:
             crossers.append((line, hw, zc[k:k + len(line)]))
             k += len(line)
+    walk_cr = crossers
+    if FOOT_CLEAR and walk and TRUE_CROSSERS_ON and len(all_cr) + len(tunnels) > len(cr):
+        # (the walkway bridges: every carriageway, not the rail's level crossings alone)
+        fc = all_cr + tunnels
+        zf = np.asarray(ground(np.concatenate([ln for ln, _ in fc])), np.float64)
+        walk_cr, k = [], 0
+        for line, hw in fc:
+            walk_cr.append((line, hw, zf[k:k + len(line)]))
+            k += len(line)
     switch = _switch_masks(rails)
     mesh = _Mesh((box[0], box[1], 0.0))
     ballast, concrete, steel = mesh.mat(BALLAST), mesh.mat(CONCRETE), mesh.mat(STEEL)
@@ -2684,7 +2729,7 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
                           if roads.box_owns(box, r[1], r[2])]
     if walk and obstacles is None:
         obstacles = pier_obstacles(frame, cells, box)
-    footbridges.add(mesh, walk, ground, crossers, ex, concrete, small, obstacles)
+    footbridges.add(mesh, walk, ground, walk_cr, ex, concrete, small, obstacles)
     small.sort(key=lambda e: -e[2])                 # (the piers first: a deck needs them more than its sleepers)
     for (c, along, across, z0, z1), hx, hy, mi in small:
         room = (TILE_VERTS_MAX - mesh.nv) // 8
