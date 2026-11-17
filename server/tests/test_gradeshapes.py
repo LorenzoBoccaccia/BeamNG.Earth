@@ -428,6 +428,24 @@ def test_a_road_dug_under_a_rail_deck_is_that_low_under_the_overpass_beside_it()
     assert zm < 1.5                                                     # the motorway about at its ground
 
 
+def test_a_short_rail_deck_switching_off_a_viaduct_is_the_viaducts_and_digs_no_road():
+    # Wien Hauptbahnhof's throat: a 53 m crossover, bridge from end to end, leaves a 386 m bridge at a switch on its
+    # middle, both over Suedtiroler Platz. Taken for a short rail deck by its own length, it stood at its ends' ground
+    # and the street was dug 7.06 m under it, the cut running 150 m on into the junction north of it. Its chain is the
+    # viaduct's: the railways', nothing to solve here; a short deck's chain (two parts end to end) still digs
+    street = Member("street", _line(0, -400, 0, 400, 200), "ground", "primary", 50, 0, 5.0, None)
+    viaduct = Member(("rail", "viaduct"), _line(-300, 0, 300, 0, 61), "rail_deck", "rail", None, 1, 2.0, None)
+    cross = Member(("rail", "crossover"), _line(-26, 0, 26, 5, 14), "rail_deck", "rail", None, 1, 2.0, None)
+    net, systems = ix.find_systems([street, viaduct, cross])
+    assert systems == []
+    assert _key_index(net, ("rail", "crossover")) in net.viaduct
+    halves = [Member(("rail", "w"), _line(-20, 0, 0, 0, 6), "rail_deck", "rail", None, 1, 2.0, None),
+              Member(("rail", "e"), _line(0, 0, 20, 0, 6), "rail_deck", "rail", None, 1, 2.0, None)]
+    net, systems = ix.find_systems([Member("street", _line(10, -400, 10, 400, 200), "ground", "primary", 50, 0, 5.0,
+                                           None)] + halves)
+    assert len(systems) == 1 and [c["moves"] for c in systems[0]["crossings"]] == ["down"]
+
+
 def test_overpasses_over_one_road_far_apart_stay_apart():
     m = [Member("street", _line(-800, 0, 800, 0, 200), "ground", "residential", 40, 0, 4.0, None),
          Member("d1", _line(0, -6, 0, 6, 4), "deck", "tertiary", 50, 1, 4.0, None),

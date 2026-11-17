@@ -8,8 +8,9 @@
 2. Who moves, at each crossing of an upper part over a lower one:
    - the lower road is mapped in a tunnel (an underpass): it goes down, the upper stays at its level (a track or a road
      at grade over it stays on its ground); a longer tunnel (TUNNEL_MAX_M) is tunnels.py's, crossed by nothing here;
-   - the upper is a rail deck: a track cannot ramp, so a short rail deck (RAIL_LONG_M) stays where the track is and the
-     road under goes down; a long one is a viaduct the railways raise themselves, nothing to solve here;
+   - the upper is a rail deck: a track cannot ramp, so a short rail deck (RAIL_LONG_M, with the rail decks it joins)
+     stays where the track is and the road under goes down; a long one is a viaduct the railways raise themselves,
+     nothing to solve here;
    - the upper is a road deck: a short deck chain (ROAD_SHORT_M) over a road is the road dug under it, and so is a
      held one (a bridge the map has over a road's short tunnel, grading's never-raised deck: the elevation there is
      its own); a longer one is an overpass that rises over the road under, which keeps its ground;
@@ -65,7 +66,8 @@ RAIL_DECK_DEPTH_M = 1.68
 COVER_M = 1.0               # m of structure over an underpass's headroom (the roof under a road or track at grade)
 TUNNEL_MAX_M = 300.0        # m: a longer road tunnel is a tunnel network of its own (tunnels.py), not an underpass
 ROAD_SHORT_M = 20.0         # m: a road deck chain this short over a road is the road dug under it
-RAIL_LONG_M = 60.0          # m: a rail deck this long is a viaduct (the railways raise it), shorter the road goes under
+RAIL_LONG_M = 60.0          # m: a rail deck chain this long is a viaduct (the railways raise it), shorter the road goes
+                            # under (_rail_viaducts)
 CONNECT_M = 400.0           # m: a road joining two decks' (or tunnels') ends no longer than this ties them in one system
 RAMP_MAX_M = 600.0          # m: the longest embankment or cut followed along a road
 DIP_MARGIN_M = 3.0          # m past the upper part's edge a road going under holds its dip before its cut ramps up
@@ -242,7 +244,7 @@ def _is_seed(net, i):
     if m.kind == "tunnel":
         return net.L[i] <= TUNNEL_MAX_M
     if m.kind == "rail_deck":
-        return net.L[i] < RAIL_LONG_M
+        return net.L[i] < RAIL_LONG_M and i not in getattr(net, "viaduct", ())
     return False
 
 
@@ -253,6 +255,33 @@ def _tunnel_network(net, j):
     Avenue de Neuilly decks ended over the 349 m Tunnel Grand-Maillot and rose 6.2 m over the square to clear a dip at
     37.3 m that was never drawn (the bore at 34 m), the street between their ends and its ramps on a 6 m fill."""
     return net.m[j].kind == "tunnel" and net.L[j] > TUNNEL_MAX_M
+
+
+def _rail_viaducts(net, cand, rel):
+    """The rail decks of cand that are parts of a viaduct: their chain (rail decks joined end to end, or at a switch:
+    an end on another's line) RAIL_LONG_M or longer, as a road deck's chain decides an overpass (ROAD_SHORT_M). The
+    map splits a viaduct at every switch: in Wien Hauptbahnhof's throat a 53 m crossover between two raised tracks,
+    bridge from end to end, one end on a 386 m bridge's middle, was taken for a short deck standing at its own ends'
+    ground, and Suedtiroler Platz was dug 7.06 m under it, its cut running 150 m on into the junction north of it."""
+    par = {}
+
+    def root(i):
+        while par[i] != i:
+            par[i] = par[par[i]]
+            i = par[i]
+        return i
+    for i in cand:
+        if net.m[i].kind != "rail_deck":
+            continue
+        par.setdefault(i, i)
+        for j, kind, _a, _b, _q in rel[i]:
+            if kind == "join" and net.m[j].kind == "rail_deck":
+                par.setdefault(j, j)
+                par[root(i)] = root(j)
+    total = {}
+    for i in par:
+        total[root(i)] = total.get(root(i), 0.0) + net.L[i]
+    return {i for i in cand if i in par and total[root(i)] >= RAIL_LONG_M}
 
 
 _PAIR_REL = {}
@@ -479,6 +508,9 @@ def find_systems(members):
     n = len(members)
     cand = [i for i in range(n) if _is_seed(net, i) and len(net.lines[i]) >= 2]
     rel = {i: [r_ for r_ in _relations(net, i) if not _tunnel_network(net, r_[0])] for i in cand}
+    # (a short rail deck in a viaduct is the viaduct's: the railways', as a long one is, and so _is_seed's from here)
+    net.viaduct = _rail_viaducts(net, cand, rel)
+    cand = [i for i in cand if i not in net.viaduct]
     # a deck chain is part of an interchange only if one of its decks crosses a road, a track or a tunnel (over or
     # under): a bridge over a river or a valley alone is the bridges' own (roads.py), not a grade separation's
     crosses = {i for i in cand if any(kind == "cross" and _over(members[i], members[j]) is not None
