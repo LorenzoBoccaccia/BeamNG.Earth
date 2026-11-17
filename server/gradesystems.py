@@ -121,23 +121,21 @@ def _arclen(line):
 
 def _seg_hits(a, b):
     """Plan crossings of polylines a and b: [(i, j, ta, tb, q)] (segment i of a at fraction ta, j of b at tb)."""
-    out = []
+    p, r = a[:-1], a[1:] - a[:-1]
+    q, sv = b[:-1], b[1:] - b[:-1]
+    lo_a, hi_a = np.minimum(a[:-1], a[1:]), np.maximum(a[:-1], a[1:])
     lo_b, hi_b = np.minimum(b[:-1], b[1:]), np.maximum(b[:-1], b[1:])
-    for i in range(len(a) - 1):
-        p, r = a[i], a[i + 1] - a[i]
-        lo, hi = np.minimum(a[i], a[i + 1]), np.maximum(a[i], a[i + 1])
-        cand = np.flatnonzero(((lo_b <= hi) & (hi_b >= lo)).all(1))
-        for j in cand:
-            q, s = b[j], b[j + 1] - b[j]
-            den = r[0] * s[1] - r[1] * s[0]
-            if abs(den) < 1e-12:
-                continue
-            d = q - p
-            ta = (d[0] * s[1] - d[1] * s[0]) / den
-            tb = (d[0] * r[1] - d[1] * r[0]) / den
-            if 0.0 <= ta <= 1.0 and 0.0 <= tb <= 1.0:
-                out.append((i, int(j), ta, tb, p + ta * r))
-    return out
+    ii, jj = np.nonzero(((lo_a[:, None, :] <= hi_b[None, :, :]) & (hi_a[:, None, :] >= lo_b[None, :, :])).all(2))
+    if not len(ii):
+        return []
+    R, S, D = r[ii], sv[jj], q[jj] - p[ii]
+    den = R[:, 0] * S[:, 1] - R[:, 1] * S[:, 0]
+    ok = np.abs(den) > 1e-12
+    den = np.where(ok, den, 1.0)
+    ta = (D[:, 0] * S[:, 1] - D[:, 1] * S[:, 0]) / den
+    tb = (D[:, 0] * R[:, 1] - D[:, 1] * R[:, 0]) / den
+    hit = ok & (ta >= 0.0) & (ta <= 1.0) & (tb >= 0.0) & (tb <= 1.0)
+    return [(int(ii[k]), int(jj[k]), float(ta[k]), float(tb[k]), p[ii[k]] + ta[k] * r[ii[k]]) for k in np.flatnonzero(hit)]
 
 
 def _proj(line, s, q):
