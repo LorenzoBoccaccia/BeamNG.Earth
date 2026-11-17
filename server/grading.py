@@ -1658,7 +1658,7 @@ class _Junctions:
 
     def __init__(self, plans):
         import fast
-        fast.require(306, "the junctions' heights")
+        fast.require(371, "the junctions' heights")
         self.plans = plans
         n = [len(p.xy) for p in plans]
         self.off = np.concatenate([[0], np.cumsum(n)]).astype(np.int64)
@@ -7279,7 +7279,7 @@ def merge_plan_set(plans):
     plans): weld_continuations (WELD_ON; a failure logged, the plans left as they were), trim_side_mouths
     (TRIM_SIDE_MOUTHS_ON), each with the plans' own ranks, on plans (a plain [Plan], in place); returns PlanPack(plans)."""
     import fast
-    fast.require(305, "plan_merge")     # (217: the trimmed plans' banks / widens; 283: the plans' flags, _plan_flags; 305: TUNNEL)
+    fast.require(371, "plan_merge")     # (217: the trimmed plans' banks / widens; 283: the plans' flags, _plan_flags; 371: TUNNEL)
     f64 = np.float64
     xy, off, z = _plan_lines(plans)
     wds = [getattr(p, "widen", None) for p in plans]
@@ -7371,7 +7371,7 @@ class PlanPack:
 
     def __init__(self, plans):
         import fast
-        fast.require(305, "plan_pack")     # (283: the plans' flags, _plan_flags; 305: the TUNNEL flag)
+        fast.require(371, "plan_pack")     # (283: the plans' flags, _plan_flags; 371: the TUNNEL flag)
         f64 = np.float64
         xy, off, z = _plan_lines(plans)
         rids = [getattr(p, "rid", -1) for p in plans]
@@ -7446,7 +7446,7 @@ def grade_points(px, py, base, plans, lift=0.0):
     if got is None:
         return out
     A, B, ZA, ZB, H, RH, RID, RK, AB, CUT, BA, BB, ST, LK, ABD = got
-    fast.require(305, "grade_points")        # (the Rust loop: native/earthfast; its segments' links: 125, yield_ramp: 126,
+    fast.require(371, "grade_points")        # (the Rust loop: native/earthfast; its segments' links: 125, yield_ramp: 126,
                                              # legs blend over each other's bands: 133, a pass road's core
                                              # given way to whole: 134, no carriageway past an abutment end: 169,
                                              # a lower road over a higher one's core, easing onto it: 181)
