@@ -209,7 +209,7 @@ def _layer_rows(f):
             for i in np.flatnonzero(subs == "rail").tolist():
                 if railways.drawn(f, i) is not None:
                     kinds[i], halves[i] = 1, RAIL_HALF_M
-            fast.require(307, "gradesep_layer_rows")
+            fast.require(371, "gradesep_layer_rows")
             toff, trng, tkind = roads._tag_flat(f)
             poff, pk, pa, pb = fast._ef.gradesep_layer_rows(
                 kinds, toff, trng, tkind, np.ascontiguousarray(f.lonlat, np.float64).reshape(-1, 2),
