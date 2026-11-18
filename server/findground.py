@@ -35,6 +35,18 @@ Pure. The railways' beds (railways.profile), the shapes (gradeshapes._system) an
 GROUND, BRIDGE, TUNNEL = "ground", "bridge", "tunnel"
 
 
+ABUTMENT_M = 1.0            # m: from a carriageway's edge the abutment of a structure over it stands
+
+
+def spanned(ends, half):
+    """The structure's run from a crossing to each end (inf or None: it goes on) as the law reads it: at least what spans
+    the way it crosses, that way's half width and the abutment's setback, whatever the map's end says (Vienna's A23: a rail
+    bridge mapped 6.6 m long over an 8.6 m carriageway ends inside it; the real structure spans the road). One source
+    for the structure's length where it crosses something: the callers pass what they read through here."""
+    floor = float(half) + ABUTMENT_M
+    return tuple(e if e is None or e == float("inf") else max(float(e), floor) for e in ends)
+
+
 def fill_run(lack, ends, grade):
     """m of approach fill the bridge's rise of lack m needs at grade, over the run of its own it has to each of its ends
     (ends: m along the structure from the crossing to its two ends, None or inf: no end that way): what the run does not

@@ -4178,6 +4178,7 @@ class _Planner:
         keys = sorted(set(mapcells.cells_for_bbox(float(cla.min()), float(clo.min()), float(cla.max()),
                                                   float(clo.max()))) | {key}, key=str)
         bridges, ground, over, limits = [], {}, [], []
+        halves = {}                     # (each ground road's half width)
         touch = []                      # (every map line near, any class, decks too: what a dead end touches none of)
         for k in keys:
             c = self._cell_enu(k)
@@ -4207,6 +4208,7 @@ class _Planner:
                 got = ground.get((fid, j))      # (the longest copy of a part, as each cell has it)
                 if got is None or len(line) > len(got[0]):
                     ground[(fid, j)] = (line, sg, med, cls)
+                    halves[(fid, j)] = float(_h)
         if not bridges or not ground:
             return
         # (single spans: neither end continues into another bridge part; deduplicated across cells, a piece lying
@@ -4380,20 +4382,22 @@ class _Planner:
                 lack = z - top + max(deck - nat, 0.0)
                 up = railwaysmod.GRADE if rail_span[bi] else roadsmod.DECK_MAX_GRADE
                 dip = fill = 0.0
+                # (the structure's run as the law reads it: it spans the road it crosses, whatever the map's end says)
+                ends_ = findground.spanned((arc_b, spans[bi][1] - arc_b), halves.get(gids[i], 0.0))
                 if not span_mapped[bi] and lack > 0.0:
                     # (the room the moves have: the ways each drags with it, a dip reaching a junction before it runs
                     # out, a fill the junctions held at the deck's ends)
                     ways = room()
                     dip = ways.dragged(i, sc, lack)
                     b_, L_ = spans[bi][0], spans[bi][1]
-                    for e, end in ((arc_b, b_[0]), (L_ - arc_b, b_[-1])):
+                    for e, end in zip(ends_, (b_[0], b_[-1])):
                         if lack - up * e < wayroom.MIN_DEPTH_M:
                             continue
                         for k, sk in ways.at_point(end, APPROACH_TOUCH_M):
                             if k != i:
                                 fill += ways.dragged(k, sk, lack - up * e, (1,) if sk < ways.L[k] / 2 else (-1,), up)
                 who = findground.leaves(findground.TUNNEL if span_mapped[bi] else findground.GROUND, findground.BRIDGE,
-                                        lack, (arc_b, spans[bi][1] - arc_b), up,
+                                        lack, ends_, up,
                                         gradelaw.road_grade(ground[gids[i]][3]),
                                         SHAPES_ON or rail_span[bi] or not fixed, dip, fill)
                 if who != "lower":

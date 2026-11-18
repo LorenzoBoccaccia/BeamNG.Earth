@@ -714,6 +714,7 @@ class _Verdicts:
             lack = clearance_need(net, u, d, q)
             lower = findground.TUNNEL if mu.held and md.kind == "ground" else WAY[md.kind]
             ends, keys = self.run(u, su)[:2]
+            ends = findground.spanned(ends, md.half)
             if lower != findground.TUNNEL and self.reader:
                 ground, fixed = self.read()
                 zd = fixed(d, sd)

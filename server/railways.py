@@ -1696,6 +1696,7 @@ def _profile(rails, ground, underpasses=()):
                 k = int(np.argmax(lack))
                 ends_m, end_nodes = _structure_run(rails, edges, ends, n, float(np.mean(sx[over])))     # (the road's own crossing)
                 rise = crossings[c][5]
+                ends_m = findground.spanned(ends_m, max(crossings[c][1] - UNDERPASS_SIDE_M, 0.0))     # (it spans the road)
                 dip = fill = 0.0
                 if lack[k] > 0.0 and rise.net is not None:
                     # (the room the moves have, wayroom: the ways the road's dip drags with it, those held at the

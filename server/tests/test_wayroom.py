@@ -66,6 +66,13 @@ class WayRoomTest(unittest.TestCase):
 
 
 class LawWithRoomTest(unittest.TestCase):
+    def test_a_structure_spans_the_way_it_crosses_whatever_the_maps_end_says(self):
+        # a rail bridge mapped 6.6 m long over an 8.6 m carriageway: 3.3 m of run each side ends inside the road
+        floor = 4.3 + findground.ABUTMENT_M
+        self.assertEqual(findground.spanned((3.3, 3.3), 4.3), (floor, floor))
+        self.assertEqual(findground.spanned((40.0, float("inf")), 4.3), (40.0, float("inf")))
+        self.assertEqual(findground.spanned((None, 2.0), 4.3), (None, floor))
+
     def test_the_room_a_dip_takes_can_turn_it_into_a_rise(self):
         # a 20 m bridge over a street with 3 m short: 10 m of own run each side, 3 / 0.05 = 60 m of ramp: 100 m of fill
         # against the street's 2 * 3 / 0.1 = 60 m of cut: the street goes down; with a side street's 45 m more it does not
