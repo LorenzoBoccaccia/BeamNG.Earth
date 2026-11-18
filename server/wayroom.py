@@ -20,29 +20,42 @@ import dnp
 JOIN_M = 2.0                # m: ways closer than this to each other, at a vertex or between two segments, are one junction
 MIN_DEPTH_M = 0.25          # m: a move smaller than this at a junction drags nothing (the roads' own surface is as flat)
 MAX_LEVELS = 4              # junctions of junctions followed this deep (a dip of 6 m at 6 % runs 100 m: a few streets)
-CELL_M = 25.0               # m: the grid the segments are indexed in
+BLOCK = 128                 # segments of a way tested against another's at once (memory: n x m pairs)
 
 
-def _seg_pair(p, q, r, t):
-    """(distance, point on pq, point on rt) of the closest approach of two segments (2-vectors): 0 where they cross."""
-    d1, d2 = q - p, t - r
-    den = d1[0] * d2[1] - d1[1] * d2[0]
-    if abs(den) > 1e-12:
-        w = r - p
-        a = (w[0] * d2[1] - w[1] * d2[0]) / den
-        b = (w[0] * d1[1] - w[1] * d1[0]) / den
-        if 0.0 <= a <= 1.0 and 0.0 <= b <= 1.0:
-            x = p + a * d1
-            return 0.0, x, x
-    best = (np.inf, p, r)
-    for pt, a, b, other_is_k in ((p, r, t, True), (q, r, t, True), (r, p, q, False), (t, p, q, False)):
-        d = b - a
-        u = float(np.clip(np.dot(pt - a, d) / max(float(np.dot(d, d)), 1e-12), 0.0, 1.0))
-        on = a + u * d
-        dist = float(dnp.hypot(*(pt - on)))
-        if dist < best[0]:
-            best = (dist, pt, on) if other_is_k else (dist, on, pt)
-    return best
+def _pairs(p, q, r, t):
+    """Closest approach of every segment pq (n, 2 each) to every segment rt (m, 2 each), as arrays (n, m): (distance, t on
+    pq, u on rt) with t and u fractions along the segments; 0 where they cross."""
+    d1, d2 = (q - p)[:, None, :], (t - r)[None, :, :]
+    w = r[None, :, :] - p[:, None, :]
+    den = d1[..., 0] * d2[..., 1] - d1[..., 1] * d2[..., 0]
+    safe = np.where(np.abs(den) > 1e-12, den, 1.0)
+    a = (w[..., 0] * d2[..., 1] - w[..., 1] * d2[..., 0]) / safe
+    b = (w[..., 0] * d1[..., 1] - w[..., 1] * d1[..., 0]) / safe
+    cross = (np.abs(den) > 1e-12) & (a >= 0.0) & (a <= 1.0) & (b >= 0.0) & (b <= 1.0)
+    best_d = np.full(den.shape, np.inf)
+    best_t, best_u = np.zeros(den.shape), np.zeros(den.shape)
+
+    def consider(dist, tt, uu):
+        better = dist < best_d
+        np.copyto(best_d, dist, where=better)
+        np.copyto(best_t, tt, where=better)
+        np.copyto(best_u, uu, where=better)
+
+    ll1 = np.maximum((d1 * d1).sum(-1), 1e-12)          # (n, 1)
+    ll2 = np.maximum((d2 * d2).sum(-1), 1e-12)          # (1, m)
+    for pt, which in ((p[:, None, :], "p"), (q[:, None, :], "q")):       # the ends of pq on rt
+        u = np.clip(((pt - r[None, :, :]) * d2).sum(-1) / ll2, 0.0, 1.0)
+        near = r[None, :, :] + u[..., None] * d2
+        consider(dnp.hypot(*(pt - near).transpose(2, 0, 1)), np.full(den.shape, 0.0 if which == "p" else 1.0), u)
+    for pt, which in ((r[None, :, :], "r"), (t[None, :, :], "t")):       # the ends of rt on pq
+        tt = np.clip(((pt - p[:, None, :]) * d1).sum(-1) / ll1, 0.0, 1.0)
+        near = p[:, None, :] + tt[..., None] * d1
+        consider(dnp.hypot(*(pt - near).transpose(2, 0, 1)), tt, np.full(den.shape, 0.0 if which == "r" else 1.0))
+    np.copyto(best_d, 0.0, where=cross)
+    np.copyto(best_t, a, where=cross)
+    np.copyto(best_u, b, where=cross)
+    return best_d, best_t, best_u
 
 
 class Ways:
@@ -55,57 +68,49 @@ class Ways:
                   for ln in self.lines]
         self.L = [float(s[-1]) for s in self.s]
         self.closed = [len(ln) > 3 and float(dnp.hypot(*(ln[0] - ln[-1]))) < JOIN_M for ln in self.lines]
-        self._grid = None
         self._met = {}
+        self._lo = np.array([ln.min(axis=0) for ln in self.lines]).reshape(-1, 2)
+        self._hi = np.array([ln.max(axis=0) for ln in self.lines]).reshape(-1, 2)
 
-    def _index(self):
-        if self._grid is None:
-            grid = {}
-            for k, ln in enumerate(self.lines):
-                for j in range(len(ln) - 1):
-                    lo = np.floor((np.minimum(ln[j], ln[j + 1]) - JOIN_M) / CELL_M).astype(int)
-                    hi = np.floor((np.maximum(ln[j], ln[j + 1]) + JOIN_M) / CELL_M).astype(int)
-                    for cx in range(lo[0], hi[0] + 1):
-                        for cy in range(lo[1], hi[1] + 1):
-                            grid.setdefault((cx, cy), []).append((k, j))
-            self._grid = grid
-        return self._grid
+    def _near(self, lo, hi):
+        """The ways whose bounding box comes within JOIN_M of the box lo..hi."""
+        ok = (self._lo <= hi + JOIN_M).all(axis=1) & (self._hi >= lo - JOIN_M).all(axis=1)
+        return np.flatnonzero(ok).tolist()
 
     def at_point(self, pt, tol=JOIN_M):
         """[(way, arc)] the ways that pass within tol of pt, where."""
-        grid, out = self._index(), {}
         pt = np.asarray(pt, np.float64)
-        for k, j in grid.get((int(np.floor(pt[0] / CELL_M)), int(np.floor(pt[1] / CELL_M))), ()):
-            a, b = self.lines[k][j], self.lines[k][j + 1]
-            d = b - a
-            u = float(np.clip(np.dot(pt - a, d) / max(float(np.dot(d, d)), 1e-12), 0.0, 1.0))
-            dist = float(dnp.hypot(*(pt - (a + u * d))))
-            if dist <= tol and (k not in out or dist < out[k][0]):
-                out[k] = (dist, float(self.s[k][j] + u * (self.s[k][j + 1] - self.s[k][j])))
-        return [(k, v[1]) for k, v in out.items()]
+        out = []
+        for k in self._near(pt - tol, pt + tol):
+            ln = self.lines[k]
+            if len(ln) < 2:
+                continue
+            d = ln[1:] - ln[:-1]
+            u = np.clip(((pt - ln[:-1]) * d).sum(1) / np.maximum((d * d).sum(1), 1e-12), 0.0, 1.0)
+            dist = dnp.hypot(*(pt - (ln[:-1] + u[:, None] * d)).T)
+            j = int(np.argmin(dist))
+            if float(dist[j]) <= tol:
+                out.append((k, float(self.s[k][j] + u[j] * (self.s[k][j + 1] - self.s[k][j]))))
+        return out
 
     def _all(self, i):
         """[(arc on i, way, arc on it)] every other way that meets way i, along it, one per way and place (a junction's
         several vertices are one); made once per way."""
         got = self._met.get(i)
         if got is None:
-            grid, ln, s = self._index(), self.lines[i], self.s[i]
-            seen, found = set(), []
-            for j in range(len(ln) - 1):
-                p, q = ln[j], ln[j + 1]
-                lo = np.floor((np.minimum(p, q) - JOIN_M) / CELL_M).astype(int)
-                hi = np.floor((np.maximum(p, q) + JOIN_M) / CELL_M).astype(int)
-                for cx in range(lo[0], hi[0] + 1):
-                    for cy in range(lo[1], hi[1] + 1):
-                        for k, m in grid.get((cx, cy), ()):
-                            if k == i or (k, m, j) in seen:
-                                continue
-                            seen.add((k, m, j))
-                            dist, on_i, on_k = _seg_pair(p, q, self.lines[k][m], self.lines[k][m + 1])
-                            if dist > JOIN_M:
-                                continue
-                            found.append((float(s[j] + dnp.hypot(*(on_i - p))), k,
-                                          float(self.s[k][m] + dnp.hypot(*(on_k - self.lines[k][m])))))
+            ln, s = self.lines[i], self.s[i]
+            found = []
+            for k in self._near(self._lo[i], self._hi[i]):
+                if k == i or len(ln) < 2 or len(self.lines[k]) < 2:
+                    continue
+                lk, sk = self.lines[k], self.s[k]
+                for j0 in range(0, len(ln) - 1, BLOCK):
+                    j1 = min(j0 + BLOCK, len(ln) - 1)
+                    dist, ti, uk = _pairs(ln[j0:j1], ln[j0 + 1:j1 + 1], lk[:-1], lk[1:])
+                    for j, m in zip(*np.nonzero(dist <= JOIN_M)):
+                        j += j0
+                        found.append((float(s[j] + ti[j - j0, m] * (s[j + 1] - s[j])), k,
+                                      float(sk[m] + uk[j - j0, m] * (sk[m + 1] - sk[m]))))
             found.sort()
             got = []
             for ai, k, ak in found:
