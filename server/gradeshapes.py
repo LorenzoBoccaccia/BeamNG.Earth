@@ -42,6 +42,7 @@ plans (cut and fill).
 import hashlib
 import heapq
 import math
+import os
 import threading
 from collections import OrderedDict, namedtuple
 
@@ -54,6 +55,7 @@ import wayroom
 import railways
 
 STEP_M = 4.0                # m between a deck's or a dip's samples
+SEGMENT_STEP_ON = os.environ.get("BNE_SEGMENT_STEP", "1").strip().lower() not in ("0", "off", "no", "false")
 JOIN_M = 2.5                # m: two parts' ends (or an end and another's line) this close meet there
 CROSS_END_M = 2.0           # m: a crossing this near either part's end is a joint, not a separation
 MERGE_DEG = 40.0            # deg: a deck's end on another deck's line at another level meets it only along it (a ramp's
@@ -417,6 +419,32 @@ def _road_of(m):
     return str(m.key[0] if isinstance(m.key, tuple) else m.key).partition("~lanes")[0]
 
 
+def one_road(members):
+    """members without the unsplit copies of roads that are also there as lane sections. A road crossing cells is cut
+    into lane sections in the cells with lane tags ("<road>~lanes<a>-<b>", lanesections.py) and stays whole in a neighbour
+    without them (replaced_roads: "keep the original if only part of its replacement is available"): the region's members
+    from several cells then held the road twice, a 46 m deck and its 53 m sections a lane's width apart, and the tunnels it
+    goes into twice, 21 ends where the road has 6: Vienna's A23 deck rose 2.3 m over its own ground in the world's solve
+    (z 162.4) where the 300 m replay, with one copy, kept it at 160.2, its carriageway beside it at 160.2 (1.7 m step, the
+    trucks into it). A copy lying along a section of its own road, within the widths of the two, is that road's section's."""
+    lanes = {}
+    for m in members:
+        if "~lanes" in str(m.key[0] if isinstance(m.key, tuple) else m.key):
+            lanes.setdefault((_road_of(m), m.kind), []).append(m)
+    if not lanes:
+        return members
+    out = []
+    for m in members:
+        key = str(m.key[0] if isinstance(m.key, tuple) else m.key)
+        if "~lanes" not in key and (key, m.kind) in lanes and len(m.line) >= 2:
+            line = np.asarray(m.line, np.float64)
+            if any(_near_line(line, np.asarray(o.line, np.float64), float(m.half + o.half)).all()
+                   for o in lanes[(key, m.kind)]):
+                continue
+        out.append(m)
+    return out
+
+
 def _end_meets(net, e, se, o, so, crossed):
     """Whether member e's end (at arc length se) on member o's line (at so) is where they meet: between parts at one
     level (a T, a ramp onto its road, a road going on), or a road on the ground ending on a structure where the map
@@ -504,11 +532,16 @@ def _over(mi, mj):
     return "i" if a > b else "j"
 
 
-def find_systems(members, reader=None):
+def find_systems(members, reader=None, trace=None):
     """The interchanges among members: [System], each closed, in a deterministic order. reader(net) -> (ground, fixed): the
-    elevation the cost of a move is read from (_Verdicts); None, flat ground."""
+    elevation the cost of a move is read from (_Verdicts); None, flat ground. trace (a dict, the audit's: interchange_audit):
+    filled with what merged the seeds, [(a, b, why, detail)] in the order they were united (why "relation": a join or a
+    crossing of two seeds, detail (kind, s on a, s on b); "ramp": a road on the ground between two seeds' ends, detail the
+    road; "dip": two seeds over one road they dig, detail None), with the seeds; nothing else about the answer."""
     net = Net(members)
     n = len(members)
+    if trace is not None:
+        trace["seeds"], trace["merges"] = [], []
     cand = [i for i in range(n) if _is_seed(net, i) and len(net.lines[i]) >= 2]
     rel = {i: [r_ for r_ in _relations(net, i) if not _tunnel_network(net, r_[0])] for i in cand}
     # a deck chain is part of an interchange only if one of its decks crosses a road, a track or a tunnel (over or
@@ -532,6 +565,8 @@ def find_systems(members, reader=None):
         return net, []
     for i in seeds:
         rel[i] = [r_ for r_ in rel[i] if r_[0] in set(seeds) or not _is_seed(net, r_[0])]
+    if trace is not None:
+        trace["seeds"] = list(seeds)
     par = {i: i for i in seeds}
 
     def root(i):
@@ -540,7 +575,9 @@ def find_systems(members, reader=None):
             i = par[i]
         return i
 
-    def unite(a, b):
+    def unite(a, b, why=None, detail=None):
+        if trace is not None:
+            trace["merges"].append((a, b, why, detail))
         ra, rb = root(a), root(b)
         if ra != rb:
             par[max(ra, rb, key=lambda x: str(members[x].key))] = min(ra, rb, key=lambda x: str(members[x].key))
@@ -548,17 +585,17 @@ def find_systems(members, reader=None):
     for i in seeds:
         for j, kind, si, sj, q in rel[i]:
             if j in par:
-                unite(i, j)
+                unite(i, j, "relation", (kind, si, sj))
             elif kind == "join" and members[j].kind == "ground":
                 ends_of.setdefault(j, set()).add(i)
     for j, ss in ends_of.items():
         if len(ss) >= 2 and net.L[j] <= CONNECT_M:
             ss = sorted(ss)
             for i in ss[1:]:
-                unite(ss[0], i)
+                unite(ss[0], i, "ramp", j)
     dig = _Verdicts(net, rel, droot, reader)
     for a, b in _shared_dips(net, seeds, rel, dig):
-        unite(a, b)
+        unite(a, b, "dip")
     groups = {}
     for i in seeds:
         groups.setdefault(root(i), []).append(i)
@@ -1319,8 +1356,13 @@ def _stacked(net, sysm, pcs, smp):
     return out
 
 
-def _solve_shape_qp(net, sysm, pcs, smp, ground, fixed_z, diagnostics):
-    import carriageways as _cw
+def shape_problem(net, sysm, pcs, smp, ground, fixed_z, trace=None):
+    """The system's constraints as the kernel is given them: (chains, couplings) of carriageways.solve (a chain per
+    piece: its target, weights, floor and ceiling per sample, grade, curve, step; the couplings: joints, overlaps,
+    clearances). trace (a dict, the audit's: interchange_audit): filled with where each constraint came from, "cp"
+    (one per coupling: ("join", index in sysm["joins"]), ("overlap",), ("clear", index in sysm["crossings"]),
+    ("stacked",)) and "bound" ({(piece, sample, "lo" | "hi"): (the bound, the crossing's index)} of the bounds a crossing
+    with a road the shape does not move set)."""
     chains = []
     natural = _natural_lines(net, sysm, pcs, smp, ground)
     for p, (pc, x, t) in enumerate(zip(pcs, smp, ground)):
@@ -1347,6 +1389,9 @@ def _solve_shape_qp(net, sysm, pcs, smp, ground, fixed_z, diagnostics):
         # step, and held at the mean its grade ran 1.8 % over the law there)
         dd = np.diff(np.asarray(x["d"], np.float64))
         step = float(dd[dd > 1e-6].min()) if (dd > 1e-6).any() else float(STEP_M)
+        # (SEGMENT_STEP_ON: each segment held to the law by its own spacing, the kernel's `ds`: one closest pair of samples,
+        # 0.3 m apart where a joint falls beside a lattice sample, held a 232 m dip piece to 0.3 m of grade all along)
+        own = dict(ds=dd) if SEGMENT_STEP_ON else {}
         # (a deck keeps its line, a road going under only its depth: W_STIFF is the least that makes a deck rise as a whole
         # by what it lacks (with the deck's own grade law, deck_grade): on a bridge over a motorway with the embankments'
         # top 6 m up its ends stand 14.92 m with the line free (1e-3), 15.42 with the deck law alone, 15.76 at 1000, on
@@ -1355,16 +1400,19 @@ def _solve_shape_qp(net, sysm, pcs, smp, ground, fixed_z, diagnostics):
         # to, and the ground roads filled or dug against the survey went from 39 / 0 / 0 to 44 / 3 / 2 per mille
         # (Brunau, Europabruecke, Duettweilerbruecke), at 3000 to 40 / 0 / 0)
         chains.append(dict(t=target, w=w, lo=lo, hi=hi, grade=g, K=rad / 100.0, lam=W_STIFF if pc["kind"] == "deck" else 1e-3,
-                           step=step, length=0.0))
-    cps = []
-    for i, si, j, sj in sysm["joins"]:
+                           step=step, length=0.0, **own))
+    cps, why = [], []
+    for n_, (i, si, j, sj) in enumerate(sysm["joins"]):
         x, y = _var(pcs, smp, i, si), _var(pcs, smp, j, sj)
         if x and y:
             cps.append((x[0], x[1] if x[3] < 0.5 else x[2], y[0], y[1] if y[3] < 0.5 else y[2], "eq", 0.0))
+            why.append(("join", n_))
     for p, a, q, b in _overlaps(pcs, smp):
         cps.append((p, a, q, b, "eq", 0.0))
+        why.append(("overlap",))
     # (the clearance wherever the road runs under the upper part, under_pairs: its whole carriageway under the deck's)
-    clear, fz = {}, {}
+    clear, fz, clear_by = {}, {}, {}
+    bound = {} if trace is not None else None
 
     def fixed(i, sv):
         new = [s_ for s_ in sv.tolist() if (i, s_) not in fz]
@@ -1372,7 +1420,7 @@ def _solve_shape_qp(net, sysm, pcs, smp, ground, fixed_z, diagnostics):
             for s_, z_ in zip(new, np.asarray(fixed_z(i, np.array(new)), np.float64).tolist()):
                 fz[(i, s_)] = z_
         return np.array([fz[(i, s_)] for s_ in sv.tolist()])
-    for c in sysm["crossings"]:
+    for ci, c in enumerate(sysm["crossings"]):
         need = clearance_need(net, c["u"], c["d"], c["q"])
         uv = np.array([p_[0] for p_ in c["under"]])
         dv = np.array([p_[1] for p_ in c["under"]])
@@ -1383,7 +1431,9 @@ def _solve_shape_qp(net, sysm, pcs, smp, ground, fixed_z, diagnostics):
             for ky, my in _weighted(ya, yb, yt):
                 m = both & mx & my
                 for key in set(zip(xp[m].tolist(), kx[m].tolist(), yp[m].tolist(), ky[m].tolist())):
-                    clear[key] = max(clear.get(key, -math.inf), need)
+                    if need > clear.get(key, -math.inf):
+                        clear[key] = need
+                        clear_by[key] = ci
         m = (xp >= 0) & (yp < 0)            # (the road under read, fixed_z: the deck over it held over it)
         if m.any():
             u_s, inv = np.unique(dv[m], return_inverse=True)
@@ -1393,6 +1443,10 @@ def _solve_shape_qp(net, sysm, pcs, smp, ground, fixed_z, diagnostics):
                 for p_ in np.unique(xp[m][ok]).tolist():
                     q_ = ok & (xp[m] == p_)
                     np.maximum.at(chains[p_]["lo"], kx[q_], zd[q_] + need)
+                    if bound is not None:
+                        for k_, v_ in zip(kx[q_].tolist(), (zd[q_] + need).tolist()):
+                            if v_ >= bound.get((p_, k_, "lo"), (-math.inf,))[0]:
+                                bound[(p_, k_, "lo")] = (v_, ci)
         m = (xp < 0) & (yp >= 0)            # (the part over read: the road under it held under it)
         if m.any():
             u_s, inv = np.unique(uv[m], return_inverse=True)
@@ -1402,9 +1456,24 @@ def _solve_shape_qp(net, sysm, pcs, smp, ground, fixed_z, diagnostics):
                 for p_ in np.unique(yp[m][ok]).tolist():
                     q_ = ok & (yp[m] == p_)
                     np.minimum.at(chains[p_]["hi"], ky[q_], zu[q_] - need)
-    cps += [(p, kx, q, ky, "ge", need) for (p, kx, q, ky), need in sorted(clear.items())]
+                    if bound is not None:
+                        for k_, v_ in zip(ky[q_].tolist(), (zu[q_] - need).tolist()):
+                            if v_ <= bound.get((p_, k_, "hi"), (math.inf,))[0]:
+                                bound[(p_, k_, "hi")] = (v_, ci)
+    for (p, kx, q, ky), need in sorted(clear.items()):
+        cps.append((p, kx, q, ky, "ge", need))
+        why.append(("clear", clear_by[(p, kx, q, ky)]))
     for q, kq, p, kp, need in _stacked(net, sysm, pcs, smp):
         cps.append((q, kq, p, kp, "ge", need))
+        why.append(("stacked",))
+    if trace is not None:
+        trace["cp"], trace["bound"] = why, bound
+    return chains, cps
+
+
+def _solve_shape_qp(net, sysm, pcs, smp, ground, fixed_z, diagnostics):
+    import carriageways as _cw
+    chains, cps = shape_problem(net, sysm, pcs, smp, ground, fixed_z)
     info = {}
     zs = _cw.solve(chains, cps, diagnostics=info)
     if diagnostics is not None:
