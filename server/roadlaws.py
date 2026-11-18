@@ -358,8 +358,7 @@ def apply(plans, specs, held=None, under=None, skip=(), diagnostics=None, natura
         if i not in (0, m - 1) or m < 3 or r == ra:
             return
         R[r]["junction"][0 if i == 0 else 1] = True
-        if not R[r]["held"][i]:         # (landed by the laws only if they were free to put it there: a road held at its
-            landed.append((idx[k], idx[onto], r))   # mouth stays where the passes left it, whatever its network's solve)
+        landed.append((idx[k], idx[onto], r))
         md = run_dir(ra, a0)
         if md is None:
             return

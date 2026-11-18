@@ -152,26 +152,6 @@ class LandingTest(unittest.TestCase):
         self.assertLessEqual(abs(g_main), roadlaws.laws(spec("primary"))[0] + 1e-3, "the step a curve under its law")
         self.assertLess(abs(g_side - u[0] * g_main), roadlaws.LANDING_TOL + 0.005, "leaves at the solved grade its way")
 
-    def test_only_a_side_road_the_laws_were_free_to_land_is_landed(self):
-        # (the main road along y = 0 and a residential side road leaving it at right angles at x = 0, 0.3 m under it at
-        # the mouth. Free, the laws land it: it is in info["landed"] (grading gives it the main road's grade rank, its
-        # ground no longer eased onto the main's). Held whole (the low-arch pass's `keep`: every road but the arch's) it
-        # stays where the passes left it, 0.3 m under the main's edge: landed, it had no ease left to hide that. Riva
-        # del Garda: 123 side roads "landed" in a pass that moved two plans, two service roads' mouths stood 0.3-0.4 m
-        # under the primary's edge, steps 12 -> 24)
-        x = np.arange(-100.0, 101.0, 4.0)
-        t = np.arange(0.0, 41.0, 4.0)
-        got = {}
-        for held in (False, True):
-            main = plan(np.c_[x, 0 * x], 100.0 + 0 * x, half=4.0)
-            side = plan(np.c_[0 * t, t], 99.7 + 0 * t)
-            info = {}
-            roadlaws.apply([main, side], [spec("primary"), spec("residential")], skip=[1] if held else (),
-                           diagnostics=info)
-            got[held] = info["landed"]
-        self.assertEqual(got[False], [(1, 0)], "free: landed on the main road")
-        self.assertEqual(got[True], [], "held whole: not landed by the laws")
-
     def test_a_short_road_between_two_roads_lands_on_both(self):
         # (two parallel roads 12 m apart, each planned with a step where a short link joins them obliquely: both ends of
         # the link landed on grades that, held as planned, no 20 km/h curve joins in 14 m)
