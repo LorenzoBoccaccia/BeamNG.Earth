@@ -1614,25 +1614,15 @@
   }
  },
  "vienna_mooslacken_1083": {
-  "steps": 34,
+  "steps": 18,
   "parts": {
-   "bridge:fc8772f1-5d78-4240-b9f6-28cfcc894555": {
-    "step_m": 1.6321,
-    "grade": 0.0,
-    "lift_g": 0.0
-   },
    "ground:44dbb086-8c34-429a-b9e1-f788916ec9f4": {
-    "step_m": 0.6359,
+    "step_m": 0.6277,
     "grade": 0.0,
     "lift_g": 0.0
    },
    "ground:7eb04a66-81b9-4a09-adbf-42a10c805e39": {
-    "step_m": 0.2177,
-    "grade": 0.0,
-    "lift_g": 0.0
-   },
-   "ground:fc8772f1-5d78-4240-b9f6-28cfcc894555": {
-    "step_m": 1.0191,
+    "step_m": 0.2103,
     "grade": 0.0,
     "lift_g": 0.0
    }
