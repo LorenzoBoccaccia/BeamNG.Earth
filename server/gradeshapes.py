@@ -49,6 +49,7 @@ import numpy as np
 import dnp
 import findground
 import gradelaw
+import wayroom
 import railways
 
 STEP_M = 4.0                # m between a deck's or a dip's samples
@@ -551,10 +552,9 @@ class _Verdicts:
     valley or a cut that already clears has none, and nothing moves). reader(net) -> (ground(xy (k, 2)) -> z (k,), fixed(i,
     s) -> z): the elevation as the solve reads it (None: flat ground, every clearance lacking in full).
 
-    A deck that already goes up over a road at the clearance's whole lack needs no reading: more lack only moves the
-    verdict toward the road going down (more to fill against the same rule), so the whole clearance as the lack is asked
-    first (the bridge going up then, it goes up), and the elevation read only for a deck that might leave the ground
-    under it. A chain whose roads under it all go down is held at its natural height (a deck is one line); one with a road it
+    Each move has the room it has (wayroom, extras): the road's dip drags down the ways it meets within its run, a fill of
+    what the deck's own run does not carry drags up the ways held at the deck's ends (the roads that leave the structure
+    there), and findground weighs both. A chain whose roads under it all go down is held at its natural height (a deck is one line); one with a road it
     rises for rises, and a road beside that goes down dips what the rise does not carry; a map's short tunnel under a
     deck (Member.held: the findground tunnel rule) holds the chain at its ground whatever."""
 
@@ -563,6 +563,7 @@ class _Verdicts:
         self.memo, self.chain_memo = {}, {}
         self._read = None
         self._links = None
+        self._ways = None
 
     def read(self):
         if self._read is None:
@@ -574,7 +575,7 @@ class _Verdicts:
         road on the ground leaves from: where the structure leaves the ground. A deck's end on another's middle (a merge,
         a ramp onto a viaduct) joins nothing here: the structure's ends are not looked for through it."""
         if self._links is None:
-            net, out, leave = self.net, {}, set()
+            net, out, leave = self.net, {}, {}
             for i, rs in self.rel.items():
                 if net.m[i].kind != "deck":
                     continue
@@ -583,7 +584,7 @@ class _Verdicts:
                         continue
                     e = int(si > net.L[i] / 2)
                     if net.m[j].kind == "ground":
-                        leave.add((i, e))
+                        leave.setdefault((i, e), []).append((j, float(sj)))
                     elif net.m[j].kind == "deck" and min(sj, net.L[j] - sj) <= JOIN_M:
                         out.setdefault((i, e), []).append((j, int(sj > net.L[j] / 2)))
             self._links = (out, leave)
@@ -641,6 +642,31 @@ class _Verdicts:
         za, zb = ground(np.array([pa, pb], np.float64))
         return float(za + (zb - za) * (su + da) / max(net.L[u] + da + db, 1e-9))
 
+    def room(self):
+        """(wayroom.Ways of the ground roads, {member: its index there}): what meets what, for the room a move has."""
+        if self._ways is None:
+            net = self.net
+            ids = [m for m in range(len(net.m)) if net.m[m].kind == "ground"]
+            self._ways = (wayroom.Ways([net.lines[m] for m in ids], [max_grade(net.m[m]) for m in ids]),
+                          {m: k for k, m in enumerate(ids)})
+        return self._ways
+
+    def extras(self, u, su, d, sd, lack, ends, keys):
+        """(dip_extra, fill_extra) at the crossing for lack m: the m of other ways the road d's dip drags down with it, and
+        the m of the ways held at the deck's two ends (keys: the end each way, (deck, end) or None) a fill of what its own
+        run (ends) does not carry drags up (wayroom)."""
+        ways, at = self.room()
+        links, leave = self.links()
+        dip = ways.dragged(at[d], sd, lack) if d in at else 0.0
+        up, fill = deck_grade(self.net.m[u]), 0.0
+        for e, key in zip(ends, keys):
+            if key is None or lack - up * e < wayroom.MIN_DEPTH_M:
+                continue
+            for j, sj in leave.get(key, ()):
+                if j in at:
+                    fill += ways.dragged(at[j], sj, lack - up * e, (1 if sj < self.net.L[j] / 2 else -1,), up)
+        return dip, fill
+
     def crossing(self, u, su, d, sd, q):
         """"down", "up" or "none" (nothing lacks: the elevation's own evidence already clears it): the road d on the
         ground at sd under deck u at su."""
@@ -649,17 +675,16 @@ class _Verdicts:
         if got is None:
             net = self.net
             mu, md = net.m[u], net.m[d]
-            need = clearance_need(net, u, d, q)
+            lack = clearance_need(net, u, d, q)
             lower = findground.TUNNEL if mu.held and md.kind == "ground" else WAY[md.kind]
-            ends = self.run(u, su)[0]
-            args = (ends, deck_grade(mu), max_grade(md))
-            who, lack = findground.leaves(lower, findground.BRIDGE, need, *args), need
-            if who == "lower" and lower != findground.TUNNEL and self.reader:
+            ends, keys = self.run(u, su)[:2]
+            if lower != findground.TUNNEL and self.reader:
                 ground, fixed = self.read()
                 zd = fixed(d, sd)
                 if zd is not None and np.isfinite(zd):
-                    lack = need - (self.natural(u, su, ground) - float(zd))
-                    who = findground.leaves(lower, findground.BRIDGE, lack, *args)
+                    lack -= self.natural(u, su, ground) - float(zd)
+            dip, fill = self.extras(u, su, d, sd, lack, ends, keys) if lower == findground.GROUND and lack > 0.0 else (0.0, 0.0)
+            who = findground.leaves(lower, findground.BRIDGE, lack, ends, deck_grade(mu), max_grade(md), True, dip, fill)
             got = self.memo[key] = "down" if who == "lower" else "up" if lack > 0.0 else "none"
         return got
 

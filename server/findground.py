@@ -16,7 +16,9 @@ or the 'find ground' rules. anything else being a tunnel or a overpass depends o
    its grade, a cut each side. A long bridge's own run carries the whole rise (the bridge goes up and the way stays,
    Duttweiler); a short one over a minor road leaves a longer fill than the road's cut, and the road goes down (a 70 m
    motorway bridge over a local road on flat ground, the I-20; a 12 m street bridge over a street); a track as a way
-   under is never dug where the bridge over it climbs as steeply as a track does (its cut is the longest).
+   under is never dug where the bridge over it climbs as steeply as a track does (its cut is the longest). Either
+   move has the room it has: where its run reaches a junction before it is spent, the ways that meet there move with it
+   (wayroom), a road under a bridge in a roundabout takes the ring and its arms down.
 4. The move is the structure's own, carried by it and the approaches joined to it, never by the other way.
 
 Measured on the survey's 311 crossings round five places in Switzerland (tests/truth.py), each way's real height
@@ -46,7 +48,7 @@ def dip_run(lack, grade):
     return 2.0 * lack / grade
 
 
-def leaves(lower, upper, lack=None, ends=None, up_grade=None, down_grade=None, fills=True):
+def leaves(lower, upper, lack=None, ends=None, up_grade=None, down_grade=None, fills=True, dip_extra=0.0, fill_extra=0.0):
     """Which of two ways leaves the ground where upper crosses over lower (each GROUND, BRIDGE or TUNNEL) and their
     natural heights lack the clearance: "lower" (it goes down), "upper" (it goes up) or None (they meet at grade).
 
@@ -55,7 +57,12 @@ def leaves(lower, upper, lack=None, ends=None, up_grade=None, down_grade=None, f
     bridge climbs (its deck's law, a track's), down_grade the grade the plain way dips and climbs at. Without them
     (the lack not known) the bridge goes up (rule 3 as it stood). Nothing lacks (lack <= 0): the bridge, nothing moves. fills False: the
     approaches cannot be filled (a deck the caller never raises on approaches: the legacy grading's motorways and trunk
-    roads): the bridge goes up only where its own run carries the whole rise, else the way goes down."""
+    roads): the bridge goes up only where its own run carries the whole rise, else the way goes down.
+
+    dip_extra and fill_extra are the room the moves have (wayroom): the m of the other ways each drags with it, a dip
+    whose run reaches a junction before it is spent takes the ways that meet there down (a roundabout's ring and its arms
+    with the road under a bridge), a fill the same where it reaches the junctions held at the deck's ends. They are
+    earth the move costs like its own run."""
     if lower == TUNNEL:
         return "lower"
     if upper != BRIDGE:
@@ -65,4 +72,4 @@ def leaves(lower, upper, lack=None, ends=None, up_grade=None, down_grade=None, f
     fill = fill_run(lack, ends, up_grade)
     if not fills:
         return "lower" if fill > 0.0 else "upper"
-    return "lower" if fill > dip_run(lack, down_grade) else "upper"
+    return "lower" if fill + fill_extra > dip_run(lack, down_grade) + dip_extra else "upper"

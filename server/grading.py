@@ -43,6 +43,7 @@ import bumps
 import mapcells
 import findground
 import gradelaw
+import wayroom
 import railways as railwaysmod
 import roads as roadsmod
 import seatiles
@@ -379,12 +380,9 @@ APPROACH_MAX_RUN = 320.0    # m: the longest ramp
 APPROACH_TOUCH_M = 2.5      # m: a road whose end is this close to an abutment leads onto the bridge
 APPROACH_MIN_CROSS_M = 6.0  # m: a road crossing a deck closer than this to its end is a junction at grade (not
                             # under it)
-RAIL_MIN_CROSS_M = 2.0      # m: ... and under a rail deck over a road with a height limit (a track's bridge over a road
-                            # is 10-12 m, a road's 6 m rule left it out; without a limit the 6 m rule stands: the
-                            # drivability ratchet's Compiegne roundabout dipped under a 7 m rail deck, 89 -> 113, and again
-                            # when findground's cost law asked every rail span, 3.9 -> 41.4: a road cannot dip in the
-                            # few metres a roundabout's arms leave it; the railways' profile reads the same rule:
-                            # railways.AT_GRADE_END_M)
+RAIL_MIN_CROSS_M = 2.0      # m: ... and under a rail deck (a track's bridge is a bridge, however short: the map says so; which of
+                            # the two moves is findground's cost law, with the room each has: a street under a 7 m rail bridge
+                            # in a roundabout takes the ring and its arms down with it)
 APPROACH_FLAT_M = 20.0      # m from an abutment the deck needs its full clearance (beyond: it may fall at DECK_GRADE)
 APPROACH_MARGIN_M = 0.3     # m over the clearance (the deck profile's smoothing takes a little off near its ends)
 JUNCTION_RAISE_ON = os.environ.get("BNE_JUNCTION_RAISE", "on") != "off"   # an approach's junction rises with it
@@ -4245,7 +4243,7 @@ class _Planner:
             cw_deck = CW_ON and not rail and self._cw_z_at(b, b[:1]) is not None
             max_l = UNDER_CHAIN_MAX_M if n in chained else UNDER_MAX_BRIDGE_M
             # (a track's bridge is a bridge, however short: the map wins; a level crossing is no bridge in the map)
-            mc = RAIL_MIN_CROSS_M if rail and limits else APPROACH_MIN_CROSS_M
+            mc = RAIL_MIN_CROSS_M if rail else APPROACH_MIN_CROSS_M
             if L < 2 * mc or (L > max_l and not rail and not cw_deck):
                 continue
             d = dnp.hypot(ue[:, :, None, 0] - ue[n, None, None, :, 0], ue[:, :, None, 1] - ue[n, None, None, :, 1])
@@ -4262,6 +4260,12 @@ class _Planner:
         lines = [ground[g][0] for g in gids]
         crs = roadsmod._crossings_by([b for b, _L, _f, _r in spans], lines)
         ez, raised = {}, set()
+        ways_ = []
+
+        def room():                         # (the ground roads as wayroom's ways, made once for the first verdict)
+            if not ways_:
+                ways_.append(wayroom.Ways(lines, [gradelaw.road_grade(ground[g][3]) for g in gids]))
+            return ways_[0]
 
         def deck_ends(j, natural=False):    # (an overpass's abutments' ground, raised when it is: as high as its ramps
             key = (j, natural)              # could take them; natural: not raised, the ground the deck's own line
@@ -4291,7 +4295,7 @@ class _Planner:
                 b, L, fixed, rail = spans[bi]
                 sign = (_limit_at(limits, pt) if RAIL_SIGNED_ON else None) if rail and limits else None
                 road_sign = None if rail else roadsmod.road_sign_at(limits, pt)
-                mc = RAIL_MIN_CROSS_M if sign is not None else APPROACH_MIN_CROSS_M
+                mc = RAIL_MIN_CROSS_M if rail else APPROACH_MIN_CROSS_M
                 if L < 2 * mc:
                     continue                    # (a deck too short to span a road)
                 if arc_b < mc or arc_b > L - mc:
@@ -4370,11 +4374,25 @@ class _Planner:
             # one) is the lifts' to move, the road under giving way only for what their ramps could not raise: not asked
             # here. Under the shapes they are the mover of every deck: asked of every span, so that exactly one way moves)
             if fixed or SHAPES_ON:
+                lack = z - top + max(deck - nat, 0.0)
+                up = railwaysmod.GRADE if rail_span[bi] else roadsmod.DECK_MAX_GRADE
+                dip = fill = 0.0
+                if not span_mapped[bi] and lack > 0.0:
+                    # (the room the moves have: the ways each drags with it, a dip reaching a junction before it runs
+                    # out, a fill the junctions held at the deck's ends)
+                    ways = room()
+                    dip = ways.dragged(i, sc, lack)
+                    b_, L_ = spans[bi][0], spans[bi][1]
+                    for e, end in ((arc_b, b_[0]), (L_ - arc_b, b_[-1])):
+                        if lack - up * e < wayroom.MIN_DEPTH_M:
+                            continue
+                        for k, sk in ways.at_point(end, APPROACH_TOUCH_M):
+                            if k != i:
+                                fill += ways.dragged(k, sk, lack - up * e, (1,) if sk < ways.L[k] / 2 else (-1,), up)
                 who = findground.leaves(findground.TUNNEL if span_mapped[bi] else findground.GROUND, findground.BRIDGE,
-                                        z - top + max(deck - nat, 0.0), (arc_b, spans[bi][1] - arc_b),
-                                        railwaysmod.GRADE if rail_span[bi] else roadsmod.DECK_MAX_GRADE,
+                                        lack, (arc_b, spans[bi][1] - arc_b), up,
                                         gradelaw.road_grade(ground[gids[i]][3]),
-                                        fills=SHAPES_ON or rail_span[bi] or not fixed)
+                                        SHAPES_ON or rail_span[bi] or not fixed, dip, fill)
                 if who != "lower":
                     continue
             if top_cw is not None and _cw.family(ground[gids[i]][3]) is not None:
