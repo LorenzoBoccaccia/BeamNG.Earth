@@ -5747,7 +5747,19 @@ class _Planner:
                 touch[js] = False
                 continue
             d = dnp.hypot(pe[js, None, 0] - ends[None, :, 0], pe[js, None, 1] - ends[None, :, 1])
-            touch[js] = (d <= APPROACH_TOUCH_M).any(axis=1)
+            near = d <= APPROACH_TOUCH_M
+            # (a road end near a bridge's end is no abutment when a ground part going on from it reaches that end: the
+            # end is the junction behind a stub, the abutment is the stub's far end. Riva del Garda, Via Gardesana: a way
+            # with 1.03 m of ground between its junction and its bridge: the junction's three roads and the stub's
+            # start all stood within 2.5 m of the bridge's end and all were flagged; held at their own heights, the stub
+            # took the hillside's raw 28 % fall in its metre, 0.86 m under the approach at the same node)
+            behind = np.zeros_like(near)
+            for a, j in enumerate(js.tolist()):
+                mates = np.flatnonzero(dnp.hypot(pe[:, 0] - pe[j, 0], pe[:, 1] - pe[j, 1]) <= CHAIN_JOIN_M)
+                for far in {int(j) ^ 1} | {int(k) ^ 1 for k in mates if k != j}:    # (the ends are start, end per part)
+                    if far < len(pe):
+                        behind[a] |= dnp.hypot(pe[far, 0] - ends[:, 0], pe[far, 1] - ends[:, 1]) <= CHAIN_JOIN_M
+            touch[js] = (near & ((d <= CHAIN_JOIN_M) | ~behind)).any(axis=1)
         return touch
 
     def _end_raised(self, xy):
