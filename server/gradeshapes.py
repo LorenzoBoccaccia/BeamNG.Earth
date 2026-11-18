@@ -725,6 +725,27 @@ class _Verdicts:
             got = self.memo[key] = "down" if who == "lower" else "up" if lack > 0.0 else "none"
         return got
 
+    def tunnel(self, u, su, d, sd, q):
+        """findground's verdict for deck u over the mapped tunnel d at its arc sd: "lower" (the tunnel goes down: rule 1) or
+        "upper" where it cannot dive what the crossing lacks, its own run to its portals and the road beyond them to cut
+        it back up in too short (the room: the road followed on through its joints), and the deck rises."""
+        key = ("tunnel", u, round(float(su), 3), d, round(float(sd), 3))
+        got = self.memo.get(key)
+        if got is None:
+            net, md = self.net, self.net.m[d]
+            lack = clearance_need(net, u, d, q)
+            if self.reader:
+                ground, _fixed = self.read()
+                za, zb = ground(np.array([net.lines[d][0], net.lines[d][-1]], np.float64))
+                lack -= self.natural(u, su, ground) - float(za + (zb - za) * sd / max(net.L[d], 1e-9))
+            g = max_grade(md)
+            reach = max(lack, 0.0) / g
+            room = tuple(sum(abs(s1 - s0) for _m, s0, s1 in walk(net, d, at_end, reach)) if reach > 0.0 else 0.0
+                         for at_end in (False, True))
+            got = self.memo[key] = findground.leaves(findground.TUNNEL, findground.BRIDGE, lack, (sd, net.L[d] - sd), None, g,
+                                                     True, 0.0, 0.0, room)
+        return got
+
     def digs(self, i):
         """Whether deck i's chain is held at its natural height with the roads under it dug: where the map has a road under
         it in a short tunnel (Member.held), or where its roads under it all say the road goes down (none says the deck
@@ -826,7 +847,8 @@ def _system(net, seeds, rel, dig):
             if j in S and str(mi.key) > str(mj.key):
                 continue                        # (a crossing of two of its own parts, once)
             mu, md = members[u], members[d]
-            who = findground.leaves(WAY[md.kind], WAY[mu.kind])
+            who = (dig.tunnel(u, su, d, sd, q) if md.kind == "tunnel" and mu.kind == "deck"
+                   else findground.leaves(WAY[md.kind], WAY[mu.kind]))
             if who == "lower":
                 moves = "down"                  # (mapped as an underpass: it goes under, what is over it stays)
             elif who == "upper" and mu.kind == "deck":

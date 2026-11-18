@@ -73,6 +73,17 @@ class LawWithRoomTest(unittest.TestCase):
         self.assertEqual(findground.spanned((40.0, float("inf")), 4.3), (40.0, float("inf")))
         self.assertEqual(findground.spanned((None, 2.0), 4.3), (None, floor))
 
+    def test_a_mapped_tunnel_goes_down_unless_it_has_no_room_to_dive(self):
+        # an 18 m tunnel under a deck that lacks 6.6 m, its road at 17 %: 9 m of its own run carry 1.5 m, 5.1 m of cut each side
+        # beyond its portals are asked. Without room given: rule 1. With the road beyond the portals: it dives. With none: the
+        # deck over it rises.
+        T, B = findground.TUNNEL, findground.BRIDGE
+        self.assertEqual(findground.leaves(T, B), "lower")
+        self.assertEqual(findground.leaves(T, B, 6.6, (9.0, 9.0), None, 0.17), "lower")
+        self.assertEqual(findground.leaves(T, B, 6.6, (9.0, 9.0), None, 0.17, True, 0.0, 0.0, (0.0, 0.0)), "upper")
+        self.assertEqual(findground.leaves(T, B, 6.6, (9.0, 9.0), None, 0.17, True, 0.0, 0.0, (40.0, 40.0)), "lower")
+        self.assertEqual(findground.leaves(T, B, 1.0, (9.0, 9.0), None, 0.17, True, 0.0, 0.0, (0.0, 0.0)), "lower")
+
     def test_the_room_a_dip_takes_can_turn_it_into_a_rise(self):
         # a 20 m bridge over a street with 3 m short: 10 m of own run each side, 3 / 0.05 = 60 m of ramp: 100 m of fill
         # against the street's 2 * 3 / 0.1 = 60 m of cut: the street goes down; with a side street's 45 m more it does not

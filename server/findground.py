@@ -9,7 +9,8 @@ or the 'find ground' rules. anything else being a tunnel or a overpass depends o
    end to end, or at a switch, are one structure).
 2. Where two ways cross and their natural heights already leave the clearance, nothing moves.
 3. Else exactly one of them leaves the ground by the lack: a tunnel under anything goes down, and what is over it
-   keeps its natural height, a bridge too; two plain ways meet at grade; where a bridge crosses a plain way, the one
+   keeps its natural height, a bridge too, unless the tunnel cannot dive the lack (no run of its own and no road
+   beyond its portals to cut in: `dives`), when the bridge over it rises; two plain ways meet at grade; where a bridge crosses a plain way, the one
    that moves is the one that costs less earth, each by its own grade law (leaves): the bridge climbs the lack at its
    grade over its own run first (its length to the nearer end of its structure, every metre of it free: piers, no
    earth) and only what that does not reach is an approach fill; the plain way dips the lack and climbs out of it at
@@ -60,7 +61,15 @@ def dip_run(lack, grade):
     return 2.0 * lack / grade
 
 
-def leaves(lower, upper, lack=None, ends=None, up_grade=None, down_grade=None, fills=True, dip_extra=0.0, fill_extra=0.0):
+def dives(lack, ends, grade, room):
+    """Whether a mapped tunnel can go down lack m: its own run to each portal (ends) carries lack at grade as far as it
+    goes, and the rest is a cut beyond the portal at that grade, which has to fit in the room the way has there (room: m
+    of road beyond each portal that can go down with it, wayroom's idea of room: a way that ends has none)."""
+    return all(max(0.0, lack / grade - e) <= r + 1e-9 for e, r in zip(ends, room))
+
+
+def leaves(lower, upper, lack=None, ends=None, up_grade=None, down_grade=None, fills=True, dip_extra=0.0, fill_extra=0.0,
+           room=None):
     """Which of two ways leaves the ground where upper crosses over lower (each GROUND, BRIDGE or TUNNEL) and their
     natural heights lack the clearance: "lower" (it goes down), "upper" (it goes up) or None (they meet at grade).
 
@@ -76,6 +85,12 @@ def leaves(lower, upper, lack=None, ends=None, up_grade=None, down_grade=None, f
     with the road under a bridge), a fill the same where it reaches the junctions held at the deck's ends. They are
     earth the move costs like its own run."""
     if lower == TUNNEL:
+        # (rule 1: the mapped tunnel goes down. With room given (ends then the tunnel's own run to its portals, down_grade
+        # its road's) it goes down by what it can: a bridge over a tunnel too short to dive the lack, and no road beyond
+        # its portals to cut it back up in, is the one that rises: its cost the other way is no cost at all)
+        if (room is not None and upper == BRIDGE and lack is not None and lack > 0.0 and ends is not None
+                and down_grade and not dives(lack, ends, down_grade, room)):
+            return "upper"
         return "lower"
     if upper != BRIDGE:
         return None
