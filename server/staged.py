@@ -73,7 +73,7 @@ def run(members, meta=None, ll=None, edge=None, ground=None, reader=True, feasib
     PlannerMeta.endinfo; keyed by the members as given); feasibility: run stage 4; heights: run stage 5 on every system stage 4 found feasible (S.heights, S.heights_of)."""
     S = Staged()
     S.name = name
-    S.P = P = s1.build(members, meta, edge)
+    S.P = P = s1.build(members, meta, edge, endinfo)
     S.net = net = P.net
     S.namer = namer = ia.Namer(net, ll, meta, edge)
     S.finds[1], S.stats[1] = s1.check(P, namer, endinfo)

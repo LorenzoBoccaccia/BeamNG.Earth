@@ -15,6 +15,7 @@ mod s3url;
 mod countrymap;
 mod carriageway_solver;
 mod carriageways;
+mod ldl;
 mod spaceclouds;
 mod cdaez;
 mod texdds;
@@ -6475,6 +6476,9 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // 309: carriageway_profiles takes a spacing per sample (the distance to the next): a segment's grade bound and a
     // window's curve bound are its own spacings', not the chain's one closest-two-samples step (a dip piece with two
     // samples 0.3 m apart was held to 0.3 m of grade over its whole length)
-    m.add("VERSION", 309)?;
+    // 310: ldl::SparseLdl (a sparse LDL' of a symmetric positive definite matrix on an AMD ordering, QDLDL through clarabel:
+    // staged_heights's ADMM solves its sweeps' linear system exactly, factored once for a rho)
+    ldl::register(m)?;
+    m.add("VERSION", 310)?;
     Ok(())
 }

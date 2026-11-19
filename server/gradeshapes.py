@@ -82,6 +82,7 @@ DIP_MARGIN_M = 3.0          # m past the upper part's edge a road going under ho
 FOOT_STEP_M = 1.0           # m between the points of a crossing's footprint (under_pairs)
 DECK_MAX_GRADE = 0.06       # a deck climbs no steeper than this (the game's: roads.DECK_MAX_GRADE, grading sets it from there)
 DECK_AIR_M = 0.5            # m: a span over the ground keeps its girders this far off it (past its abutments: _abutments)
+ON_GROUND_M = 0.05          # m: an end this near the ground is on it (no ramp from it)
 SOFT_M = 0.6                # m: the rounding where an embankment meets the ground (a soft maximum)
 
 CLEAR_PATH_M = 3.0          # m: a path's headroom (no vehicle on it)
@@ -1560,6 +1561,10 @@ def embankments(net, systems, shapes, ground_along):
             z0, g = shape_z(i, si)
             if z0 is None:
                 continue
+            if abs(z0 - float(ground_along(j, np.array([sj]))[0])) < ON_GROUND_M:
+                continue            # (a deck held at its ground ends on it: no ramp. Which side of the ground a few mm put it chose
+                # between a cut and a fill, the two 600 m apart where the ground falls away: Tamar's road 4e06ec6a, the kernel's
+                # 0.5 mm under it a 22-sample cut, an exact solve's a 9-sample fill, 0.4 to 7.5 m of lift)
             leaving = -g if si < net.L[i] / 2 else g        # (the deck's grade on the way out of it)
             ramp_from(j, sj, sj < net.L[j] / 2, z0, leaving)
         # a road going under: its dip (cut), and on from its ends if they are not back on the ground
@@ -1570,7 +1575,7 @@ def embankments(net, systems, shapes, ground_along):
             for e in (0, len(z) - 1):
                 j, s_ = int(x["mem"][e]), float(x["ms"][e])
                 gr = ground_along(j, np.array([s_]))[0]
-                if abs(z[e] - gr) < 0.05:
+                if abs(z[e] - gr) < ON_GROUND_M:
                     continue
                 k2 = 1 if e == 0 else len(z) - 2
                 g = (z[e] - z[k2]) / max(abs(x["d"][e] - x["d"][k2]), 1e-6)

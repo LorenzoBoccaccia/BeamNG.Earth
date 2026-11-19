@@ -16,7 +16,7 @@ except ImportError:         # no binary for this platform / Python: require() sa
     _ef = None
 
 AVAILABLE = _ef is not None
-MIN_VERSION = 309 # the newest kernel signature the server calls (earthd checks it at start)
+MIN_VERSION = 310 # the newest kernel signature the server calls (earthd checks it at start)
 
 
 class NativeMissing(RuntimeError):
@@ -75,6 +75,15 @@ def island_ring_rays(poly, lines_hw, c, rays, step, rmax):
     segs, hw = segments(lines_hw)
     return _ef.island_ring_rays(np.ascontiguousarray(poly[:, :2], np.float64), segs, hw, float(c[0]), float(c[1]),
                                 int(rays), float(step), float(rmax))
+
+
+def sparse_ldl(n, indptr, indices, data):
+    """earthfast.SparseLdl: the exact solver of a symmetric positive definite matrix (n x n, its upper triangle as CSC: indptr,
+    sorted row indices, data), factored on an AMD ordering; .refactor(data) puts new values on the same structure, .solve(b) gives
+    x of A x = b (staged_heights: ADMM's linear system)."""
+    require(310, "SparseLdl")
+    return _ef.SparseLdl(int(n), np.ascontiguousarray(indptr, np.int64), np.ascontiguousarray(indices, np.int64),
+                         np.ascontiguousarray(data, np.float64))
 
 
 class Others:

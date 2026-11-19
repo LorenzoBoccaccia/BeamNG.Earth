@@ -66,6 +66,7 @@ class Grounds:
 FOOTPRINT_STEP_M = 4.0      # m: a ground road is read along every this far for what lies under it
 PORTAL_M = 30.0             # m: from a tunnel's end, a road is on its approach, not over it
 MARGIN_M = 8.0              # m: the stretch each side of a footprint that is still the trench wall, no anchor (the trench is wider than the tunnel)
+ANCHOR_REACH_M = gs.RAMP_MAX_M   # m: how far along the road beyond a member an anchor is looked for
 
 
 def footprints(net):
@@ -111,10 +112,57 @@ def footprints(net):
 def anchored(net, fixed_z):
     """fixed_z(i, s) with the ground roads' points over a tunnel's footprint taken from their anchors: where member i has stretches over
     a footprint, its height at s there is the straight line between the nearest points of the road outside any (the elevation's, as
-    fixed_z gives it); a road with none outside keeps the elevation. Other members, and points outside, are fixed_z's own."""
+    fixed_z gives it). Where the member's own part outside them runs out (a street part wholly over the trench, or over it to its
+    end: Porte Maillot's street 14 m from the LiDAR's point on the slab, 7 m under it in the trench floor with its own anchors only),
+    the anchor is the first ground point of the road beyond that end, outside the footprints, followed on through its joints
+    (gradeshapes.walk, ANCHOR_REACH_M at most). A road with none anywhere keeps the elevation. Other members, and points outside, are
+    fixed_z's own."""
     fp = footprints(net)
     if not fp:
         return fixed_z
+    lines = {}
+
+    def over(j, sv):
+        inside = np.zeros(len(sv), bool)
+        for a, b in fp.get(j, ()):
+            inside |= (sv > a) & (sv < b)
+        return inside
+
+    def beyond(i, at_end):
+        """(m past the end of member i, the elevation) of the first ground point past its end outside every footprint, or None."""
+        d0 = 0.0
+        for j, s0, s1 in gs.walk(net, i, at_end, ANCHOR_REACH_M):
+            run = abs(s1 - s0)
+            if net.m[j].kind == "ground":
+                sv = np.linspace(s0, s1, max(2, int(math.ceil(run / FOOTPRINT_STEP_M)) + 1))
+                z = np.atleast_1d(np.asarray(fixed_z(j, sv), np.float64))
+                free = ~over(j, sv) & np.isfinite(z)
+                if free.any():
+                    q = int(np.flatnonzero(free)[0])
+                    return d0 + abs(float(sv[q]) - s0), float(z[q])
+            d0 += run
+        return None
+
+    def line_of(i):
+        """(arc lengths, elevations) of member i's anchors, ascending in arc length (past an end: beyond 0 or L)."""
+        if i not in lines:
+            k = max(2, int(math.ceil(net.L[i] / FOOTPRINT_STEP_M)) + 1)
+            grid = np.linspace(0.0, net.L[i], k)
+            zg = np.atleast_1d(np.asarray(fixed_z(i, grid), np.float64))
+            free = ~over(i, grid) & np.isfinite(zg)
+            xs, zs = list(grid[free]), list(zg[free])
+            if not free[0]:
+                got = beyond(i, False)
+                if got is not None:
+                    xs.insert(0, -got[0])
+                    zs.insert(0, got[1])
+            if not free[-1]:
+                got = beyond(i, True)
+                if got is not None:
+                    xs.append(net.L[i] + got[0])
+                    zs.append(got[1])
+            lines[i] = (np.array(xs, np.float64), np.array(zs, np.float64))
+        return lines[i]
 
     def fixed(i, s):
         spans = fp.get(int(i)) if np.ndim(i) == 0 else None
@@ -122,18 +170,11 @@ def anchored(net, fixed_z):
             return fixed_z(i, s)
         sv = np.atleast_1d(np.asarray(s, np.float64))
         z = np.asarray(fixed_z(i, sv), np.float64).copy()
-        inside = np.zeros(len(sv), bool)
-        for a, b in spans:
-            inside |= (sv > a) & (sv < b)
+        inside = over(int(i), sv)
         if inside.any():
-            k = max(2, int(math.ceil(net.L[i] / FOOTPRINT_STEP_M)) + 1)
-            grid = np.linspace(0.0, net.L[i], k)
-            free = np.ones(k, bool)
-            for a, b in spans:
-                free &= ~((grid > a) & (grid < b))
-            if free.any():
-                zg = np.asarray(fixed_z(i, grid[free]), np.float64)
-                z[inside] = np.interp(sv[inside], grid[free], zg)
+            xs, zs = line_of(int(i))
+            if len(xs):
+                z[inside] = np.interp(sv[inside], xs, zs)
         return z if np.ndim(s) else float(z[0])
     return fixed
 

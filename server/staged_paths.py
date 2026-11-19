@@ -138,6 +138,7 @@ class Paths:
         self.net, self.meta, self.edge = net, meta or {}, edge
         self.cleaned = cleaned          # Cleaned: what was dropped, merged, absorbed before the paths (None: the net as given)
         self.bridged = []               # (End, End, gap m): parts of one road joined by its identity across a gap
+        self.by_node = set()            # the (End, End) of bridged that the map's node joined (not one road's identity)
         self.faced = []                 # (End, End, gap m): structure ends facing each other across a gap, joined (_bridge_facing)
         self.cut = []                   # (End, End): pairs unpaired because the chain ran against its own one-way flows
         self.paths = []
@@ -219,11 +220,12 @@ def _out(net, i, e):
     return v / max(_len(v), 1e-9)
 
 
-def build(members, meta=None, edge=None):
+def build(members, meta=None, edge=None, endinfo=None):
     """The paths of the map's members (gradeshapes.Member list): Paths, over the cleaned net P.net (clean: one segment per road
     part, no point closer than MIN_SEG_M to the last). meta: {Earth feature id: {osm, name, layer, oneway, dir}} (what the map
     has of a road; {} where nothing is known: every road two-way), edge(xy) -> whether the point is at the edge of the map data
-    read (a road met there may go on in a cell not read)."""
+    read (a road met there may go on in a cell not read). endinfo: what the map has at a member's end (check's), which joins what the
+    map has at one node (_bridge_map_nodes)."""
     cl = clean(members, meta)
     net = gs.Net(cl.members)
     P = Paths(net, meta, edge, cl)
@@ -333,6 +335,7 @@ def build(members, meta=None, edge=None):
         P.mate[a], P.mate[b] = b, a
         P.joints[jx].paired.append((a, b))
     _bridge_road_parts(P, ok)
+    _bridge_map_nodes(P, ok, endinfo)
     _bridge_facing(P, ok)
     _cut_mixed(P, ok)
     _traps(P)
@@ -610,6 +613,67 @@ def _bridge_road_parts(P, ok):
             for e in (a, b):
                 P.joint_of[e] = len(P.joints)
             P.joints.append(jt)
+
+
+def _bridge_map_nodes(P, ok, endinfo):
+    """Roads on the ground that the map joins at one node and whose lines stop short of it: an end the map has at the node of another
+    road's end (the same connector: endinfo's `others`), the other a road's end nothing joins, within NEAR_GAP_M of it and each ahead
+    of the traffic the other brings, is joined to it across the gap, a note with the metres. The map's node decides, not the distance
+    (Prague's Brnenska, two trunk ways 3.8 m apart that the map has at one node: the traffic of one arrived at an end with nothing
+    to take it on, the road it goes on into stood 3.8 m away). Nearest first, each end once."""
+    if endinfo is None:
+        return
+    net = P.net
+    by_id = {}
+    for i in ok:
+        if net.m[i].kind not in STRUCT:
+            m = net.m[i]
+            by_id.setdefault(str(m.key[0] if isinstance(m.key, tuple) else m.key), []).append(i)
+    cand = []
+    for i in sorted(ok):
+        if net.m[i].kind in STRUCT:
+            continue
+        for e in (0, 1):
+            a = End(i, e)
+            if a in P.mate:
+                continue
+            facts = _end_facts(P, endinfo, i, e)
+            if facts is None:
+                continue
+            pa = net.lines[i][0 if e == 0 else -1]
+            for o in facts["others"]:
+                for j in by_id.get(str(o[0]), ()):
+                    if j == i or _network(net, i) != _network(net, j):
+                        continue
+                    for g in (0, 1):
+                        b = End(j, g)
+                        if b in P.mate or b in P.partners or b in P.touch:
+                            continue        # (nothing joins b: the end a road's line stops at short of the node)
+                        d = _len(net.lines[j][0 if g == 0 else -1] - pa)
+                        if not (gs.JOIN_M < d <= NEAR_GAP_M):
+                            continue
+                        ea, la = P.flow(i, e)
+                        eb, lb = P.flow(j, g)
+                        if (la and eb) or (lb and ea):
+                            cand.append((d, a, b))
+    cand.sort(key=lambda c: (c[0], _key(net, c[1].seg) + (c[1].end,), _key(net, c[2].seg) + (c[2].end,)))
+    for d, a, b in cand:
+        if a in P.mate or b in P.mate:
+            continue
+        P.mate[a], P.mate[b] = b, a
+        P.bridged.append((a, b, d))
+        P.by_node.add((a, b))
+        jx = P.joint_of.get(a)
+        if jx is None:
+            jt = Joint(net.lines[a.seg][0 if a.end == 0 else -1])
+            jt.ends = [a]
+            jx = len(P.joints)
+            P.joints.append(jt)
+            P.joint_of[a] = jx
+        jt = P.joints[jx]
+        jt.ends.append(b)
+        jt.paired.append((a, b))
+        P.joint_of[b] = jx
 
 
 def _bridge_facing(P, ok):
@@ -928,7 +992,7 @@ def _apart(P, namer, pe, name, facts, index):
 def check(P, namer, endinfo=None):
     """Stage 1's checks. ([Finding], stats): every failure named by its Earth id, OSM way and lat / lon (namer: interchange_audit.
     Namer over the same net and meta). Fails: broken_part, missing_segment, duplicated_segment, path_gap, gap, duplicate (a structure twice), overlap,
-    oneway_trap, path_direction, dangling_end; notes: duplicate / overlap of ground roads, oneway_source, path_cut, facing_join, identity_join,
+    oneway_trap (where the map says nothing at that node), path_direction, dangling_end; notes: oneway_taken_outside, node_join, duplicate / overlap of ground roads, oneway_source, path_cut, facing_join, identity_join,
     collapsed_copy, absorbed_part, free_end (a road's dead end), end_at_data_edge, zero_length."""
     net = P.net
     finds = []
@@ -977,6 +1041,12 @@ def check(P, namer, endinfo=None):
     bridged_set = set()
     for a_, b_, gap in P.bridged:
         bridged_set |= {(a_, b_), (b_, a_)}
+        if (a_, b_) in P.by_node:
+            finds.append(Finding(1, "node_join", "note",
+                                 "%s and %s are roads the map has at one node, their lines %.1f m apart: joined across the gap"
+                                 % (namer.label(a_.seg), namer.label(b_.seg), gap), namer.point(P.joints[P.joint_of[a_]].point),
+                                 [namer.info(a_.seg), namer.info(b_.seg)]))
+            continue
         finds.append(Finding(1, "identity_join", "note",
                              "%s and %s are parts of one road %.1f m apart (its end and its next part's start): joined by the road's "
                              "identity" % (namer.label(a_.seg), namer.label(b_.seg), gap), namer.point(P.joints[P.joint_of[a_]].point),
@@ -1031,10 +1101,27 @@ def check(P, namer, endinfo=None):
     for jx, jt in enumerate(P.joints):
         where = namer.point(jt.point)
         if jt.traps:
-            finds.append(Finding(1, "oneway_trap", "fail",
-                                 "at %s the traffic of %s arrives and no road there takes it on (every end there is a one-way road's "
-                                 "arriving end)" % (where, " and ".join(namer.label(a.seg) for a in jt.traps[:3])), where,
-                                 [namer.info(a.seg) for a in jt.traps[:3]]))
+            text = ("at %s the traffic of %s arrives and no road there takes it on (every end there is a one-way road's arriving end)"
+                    % (where, " and ".join(namer.label(a.seg) for a in jt.traps[:3])))
+            code, level = "oneway_trap", "fail"
+            if endinfo is not None:
+                # (what the map has at that node decides: a road of it that takes the traffic on, one the joint's members leave out (outside
+                # the region read, or no member), is the check's own gap, a note; none that does is the map's ways disagreeing)
+                own = {str(net.m[a.seg].key[0] if isinstance(net.m[a.seg].key, tuple) else net.m[a.seg].key) for a in jt.ends}
+                takers, seen = [], False
+                for a in jt.traps:
+                    facts = _end_facts(P, endinfo, a.seg, a.end)
+                    if facts is None:
+                        continue
+                    seen = True
+                    takers += [o for o in facts["others"] if str(o[0]) not in own and ia._flow(o[6], o[5])[0]]
+                if takers:
+                    code, level = "oneway_taken_outside", "note"
+                    text += "; the map's road %s at that node does take it on (one this joint's members leave out)" % ia._other_text(takers[0])
+                elif seen:
+                    code, level = "oneway_map", "map"
+                    text += "; no road of the map at that node takes it on: the ways' one-way directions disagree there"
+            finds.append(Finding(1, code, level, text, where, [namer.info(a.seg) for a in jt.traps[:3]]))
         if jt.sources:
             finds.append(Finding(1, "oneway_source", "note",
                                  "at %s %s start%s where no road brings traffic (its feeder is not in the map read, or the map has none)"

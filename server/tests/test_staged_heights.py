@@ -9,6 +9,7 @@ import pytest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
+import fast  # noqa: E402
 import gradeshapes as gs  # noqa: E402
 import staged  # noqa: E402
 import staged_feasible as s4  # noqa: E402
@@ -38,30 +39,60 @@ def placed(members, ground=None):
     return staged.run(pl.members, pl.meta, None, None, pl.ground, feasibility=False)
 
 
-def test_the_banded_solve_is_the_dense_one():
+def test_the_sparse_ldl_solves_the_dense_system_and_again_after_new_values():
     rng = np.random.default_rng(5)
-    n = 40
-    d = rng.uniform(5.0, 9.0, n)
-    e = rng.uniform(-1.0, 1.0, n)
-    f = rng.uniform(-0.5, 0.5, n)
-    e[17] = f[17] = f[16] = 0.0               # (two chains: nothing across 17 | 18)
-    M = np.diag(d) + np.diag(e[:-1], 1) + np.diag(e[:-1], -1) + np.diag(f[:-2], 2) + np.diag(f[:-2], -2)
+    n = 60
+    M = np.zeros((n, n))
+    for i in range(n):
+        M[i, i] = rng.uniform(6.0, 9.0)
+        for j in (i + 1, i + 2, (i * 7 + 3) % n):         # (bands, and a few entries off them: the rows between pieces)
+            if j > i:
+                M[i, j] = M[j, i] = rng.uniform(-1.0, 1.0)
+    up = np.triu(M)
+    ptr = np.r_[0, np.cumsum([int(np.count_nonzero(up[:, j])) for j in range(n)])]
+    idx = np.concatenate([np.flatnonzero(up[:, j]) for j in range(n)])
+    val = np.concatenate([up[np.flatnonzero(up[:, j]), j] for j in range(n)])
+    f = fast.sparse_ldl(n, ptr, idx, val)
     b = rng.normal(size=n)
-    got = h5.Banded(d, e, f).solve(b)
-    assert np.abs(M @ got - b).max() < 1e-12
-    # the batched sweeps over the chains give the same bits
-    off = [0, 18, 40]
-    batch = h5.BandedBatch(d, e, f, off).solve(b)
-    assert batch.tobytes() == got.tobytes() or np.abs(batch - got).max() < 1e-13
+    x = f.solve(b)
+    assert np.abs(M @ x - b).max() < 1e-12
+    assert f.solve(b).tobytes() == x.tobytes()
+    val2 = val * 1.5
+    val2[ptr[1:] - 1] += 2.0                       # (the diagonal: the last entry of each column)
+    f.refactor(val2)
+    M2 = M * 1.5 + np.diag(np.full(n, 2.0))
+    assert np.abs(M2 @ f.solve(b) - b).max() < 1e-12
+    with pytest.raises(ValueError):                 # (an indefinite matrix is an error, never a regularised answer)
+        f.refactor(-val)
 
 
-def test_the_batched_sweeps_and_the_one_at_a_time_give_the_same_heights(monkeypatch):
+def test_the_sweeps_matrix_is_h_plus_sigma_plus_a_rho_a_transposed():
     S = placed(overpass())
     sysm = S.G.systems[0]
-    a = h5.solve_system(S.net, sysm, S.ground)
-    monkeypatch.setattr(h5, "BATCH_MIN", 1)
-    b = h5.solve_system(S.net, sysm, S.ground)
-    assert max(float(np.abs(x - y).max()) for x, y in zip(a.zs, b.zs)) < 1e-6 and a.stats["iterations"] == b.stats["iterations"]
+    pcs = gs.pieces(S.net, sysm)
+    smp = gs.sample(S.net, pcs)
+    gl = s4.ground_lists(S.ground, S.net, smp)
+    cons = h5.constraints_of(S.net, sysm, pcs, smp, gl, S.ground.fixed, S.ground.at)
+    P = h5.Problem(cons)
+    bn = np.flatnonzero(np.isfinite(P.lo) | np.isfinite(P.hi))
+    c0, c1, c2 = P.CA, -(P.CA + P.CC), P.CC
+    kkt = h5.Kkt(P, bn, c0, c1, c2)
+    m1, m2, m3 = len(P.A), len(bn), len(P.K0)
+    N = P.N
+    rv = np.random.default_rng(2).uniform(0.5, 20.0, m1 + m2 + m3)
+    A = np.zeros((m1 + m2 + m3, N))
+    A[np.arange(m1), P.B] += 1.0
+    A[np.arange(m1), P.A] -= 1.0
+    A[m1 + np.arange(m2), bn] = 1.0
+    for k in range(m3):
+        A[m1 + m2 + k, P.K0[k]] = c0[k]
+        A[m1 + m2 + k, P.K0[k] + 1] = c1[k]
+        A[m1 + m2 + k, P.K0[k] + 2] = c2[k]
+    H = np.diag(P.hd) + np.diag(P.he[:-1], 1) + np.diag(P.he[:-1], -1) + np.diag(P.hf[:-2], 2) + np.diag(P.hf[:-2], -2)
+    K = H + h5.SIGMA * np.eye(N) + A.T @ (rv[:, None] * A)
+    kkt.factor(rv)
+    b = np.random.default_rng(3).normal(size=N)
+    assert np.abs(K @ kkt.solve(b) - b).max() < 1e-8 * max(1.0, np.abs(K).max())
 
 
 def test_an_overpass_gets_heights_that_hold_every_law_and_match_the_kernels():
@@ -175,27 +206,3 @@ def test_popolis_tubes_agree_with_the_kernel_curve_bound_and_all():
         worst = max(worst, max(float(np.abs(a - b).max()) for a, b in zip(H.zs, zk)))
         assert H.stats["curve_excess_m"] <= 2e-3
     assert worst < 0.01
-
-
-def test_the_end_of_a_dip_is_held_to_the_ground_the_problem_has_there_not_to_another_reading_of_it():
-    """Compiegne's roundabout was infeasible in staged and not in the kernel: the hold on a dip's last sample read the graded road's
-    height (55.68 m) while the problem's own ceiling there, the ground list, was 54.83 m, so the hold's floor stood 0.85 m over the
-    ceiling. The hold takes the ground list's number, the one its ceiling is."""
-    m = [road(("street", "ground", "street"), line(-400, 0, 400, 0, 100), cls="residential", kmh=40, half=4.0),
-         road(("deck", "deck", 0, 0), line(0, -6, 0, 6, 4), "deck", "tertiary", 1.0, half=4.0),
-         road(("s", "ground", "s"), line(0, -300, 0, -6), cls="tertiary", kmh=50, half=4.0),
-         road(("n", "ground", "n"), line(0, 6, 0, 300), cls="tertiary", kmh=50, half=4.0)]
-    S = placed(m)
-    sysm = S.G.systems[0]
-    pcs = gs.pieces(S.net, sysm)
-    assert any(pc["kind"] == "dip" for pc in pcs)
-    smp = gs.sample(S.net, pcs)
-    gl = [np.asarray(a, np.float64) + 0.85 for a in s4.ground_lists(S.ground, S.net, smp)]
-    other = type("G", (), {"at": staticmethod(lambda mm, s: np.full(np.shape(s), 99.0)), "fixed": staticmethod(S.ground.fixed)})
-    held = [h for h in s4.holds_of(S.net, sysm, pcs, smp, other, lambda p, i: (p, i), gl) if "going under" in h.text]
-    assert held
-    ends = {(p, e) for p, pc in enumerate(pcs) if pc["kind"] == "dip" for e in (0, len(smp[p]["ms"]) - 1)}
-    for h in held:
-        p, e = h.node
-        assert (p, e) in ends
-        assert h.hi == pytest.approx(float(gl[p][e]))

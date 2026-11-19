@@ -32,14 +32,14 @@ Convergence is a theorem, not a hope: the objective is strictly convex (W_MIN) a
 feasible (stage 4: no negative cycle, and the potentials it found are the start), the two-block ADMM converges for every rho > 0
 and relaxation a in (0, 2): the primal residual |Ax - z| and the dual one |Hx - h + A'y| go to zero and x to the one minimiser
 (Boyd et al. 2011, section 3.2). What the code reports is the residuals it stopped on, never more than that. The linear system is
-solved by preconditioned conjugate gradients with the banded part of the matrix as the preconditioner: H is banded by piece
-(pentadiagonal, nothing across two pieces), and so are the grade rows between neighbouring samples; they are factored (LDL', plain
-floats, the pieces of similar length swept side by side) once for a rho and used for every solve. What is left of the matrix are
-the rows between pieces (the joints, the clearances, the overlaps): that many directions at most (rank of the rest) for conjugate
-gradients to find, each a banded solve. So one path is solved between its ground points, the piece's own line at once, and a
-joint's equality is a row between two pieces' samples whose multiplier the iteration finds: the residual at the joints
-(stats["joint_gap_m"]) is what is left of it. rho is rescaled by the residuals' balance (OSQP's rule) at most MAX_RHO times, each a new
-factorisation; the work is MAX_ITER sweeps of at most PCG_MAX solves, bounded by those and never by a clock.
+solved exactly: a sparse LDL' (QDLDL on an AMD ordering, earthfast's SparseLdl, the pair Clarabel carries for the kernel) of the
+matrix, factored once for a rho and solved by two triangular sweeps an iteration, the way OSQP's direct solver does it. The steps
+are ours; only the linear solve is a library's, and a deterministic one (no threads, one order of operations). The first version
+solved it by conjugate gradients with the banded part of the matrix as the preconditioner: the rows between pieces (joints,
+clearances, overlaps) left about 35 solves a sweep of ~10 ms each in Python, and Nanpu's 78 382 samples took 658 s and stopped at the
+cap with 0.035 m of violation. A joint's equality is a row between two pieces' samples whose multiplier the iteration finds: the
+residual at the joints (stats["joint_gap_m"]) is what is left of it. rho is rescaled by the residuals' balance (OSQP's rule) at
+most MAX_RHO times, each a new factorisation on the same ordering; the work is MAX_ITER sweeps at most, never a clock.
 
 The exact bounds: from stage 4's graph the tightest height each node can have (shortest paths from the zero node, forward for the
 ceiling, backward for the floor: Bellman-Ford with a queue, the graph has no negative cycle) are the box rows' bounds (the set of
@@ -57,6 +57,7 @@ from collections import deque
 import numpy as np
 
 import dnp
+import fast
 import gradeshapes as gs
 import interchange_audit as ia
 import staged_feasible as s4
@@ -64,15 +65,12 @@ import staged_ground as s3
 
 TOL_M = 5e-4            # m: the iteration stops when no row is further than this from its bounds (and the dual residual is small)
 VIOLATION_M = 2e-3      # m: an answer whose worst constraint is violated by more than this is not given as converged
-MAX_ITER = 6000         # sweeps at most (the work is bounded by this, never by a clock)
+MAX_ITER = 50000        # sweeps at most (the work is bounded by this, never by a clock). The sweeps are first order: Perth's six-piece system needs
+#                         10 330 of them to the kernel's answer (0.3 mm), an exact solve each, whatever rho (tried 25 to 2 500, rescaled every 25 to 100)
 MAX_RHO = 12            # rescalings of rho at most
-BATCH_MIN = 24         # chains of one length class laid side by side from this many (below, one at a time is cheaper)
 RHO0 = 10.0
 RHO_EQ = 1.0
 SIGMA = 1e-6
-PCG_MAX = 60
-PCG_TOL = 1e-9
-PCG_REL = 0.05
 DUAL_ABS = 1e-4
 ALPHA = 1.6             # over-relaxation (Boyd 3.4.3: any value in (0, 2) keeps the convergence)
 W_MIN = 1e-3            # least weight of a sample on its target: the kernel's (carriageway_solver.rs W_MIN), the strictly convex part
@@ -221,116 +219,6 @@ class Problem:
         return worst, kinds
 
 
-class Banded:
-    """LDL' of a symmetric pentadiagonal matrix (diagonal d, first band e: i with i+1, second band f: i with i+2; zero across the
-    chains' ends): made once, solved by two sweeps. Plain floats in plain order, the same on every platform."""
-
-    def __init__(self, d, e, f):
-        n = len(d)
-        d, e, f = d.tolist(), e.tolist(), f.tolist()
-        D = [0.0] * n
-        l1 = [0.0] * n
-        l2 = [0.0] * n
-        for i in range(n):
-            a = b = 0.0
-            if i >= 2:
-                b = f[i - 2] / D[i - 2]
-            if i >= 1:
-                a = (e[i - 1] - (b * D[i - 2] * l1[i - 1] if i >= 2 else 0.0)) / D[i - 1]
-            l1[i], l2[i] = a, b
-            D[i] = d[i] - a * a * (D[i - 1] if i >= 1 else 0.0) - b * b * (D[i - 2] if i >= 2 else 0.0)
-            if not D[i] > 0.0:
-                raise ValueError("the banded system is not positive definite at %d (pivot %g)" % (i, D[i]))
-        self.n, self.D, self.l1, self.l2 = n, D, l1, l2
-
-    def solve(self, rhs):
-        n, D, l1, l2 = self.n, self.D, self.l1, self.l2
-        y = rhs.tolist()
-        for i in range(1, n):                   # (L y = rhs)
-            v = y[i] - l1[i] * y[i - 1]
-            if i >= 2:
-                v -= l2[i] * y[i - 2]
-            y[i] = v
-        for i in range(n):                      # (D)
-            y[i] /= D[i]
-        for i in range(n - 2, -1, -1):          # (L' x = y)
-            v = y[i] - l1[i + 1] * y[i + 1]
-            if i + 2 < n:
-                v -= l2[i + 2] * y[i + 2]
-            y[i] = v
-        return np.array(y, np.float64)
-
-
-class BandedBatch:
-    """The same LDL' as Banded, for a matrix of independent chains (the pieces: nothing couples one to the next), done a sweep for every
-    chain at once: the chains of similar length are laid side by side (padded with an identity) and the recurrence runs along them
-    in step, so a system of a thousand short pieces costs the length of its longest piece's sweeps, not the sum of all. Each
-    chain's arithmetic is the same operations in the same order as Banded's, so the answers agree to the last bit."""
-
-    def __init__(self, d, e, f, off):
-        self.n = len(d)
-        spans = [(off[c], off[c + 1]) for c in range(len(off) - 1) if off[c + 1] > off[c]]
-        buckets = {}
-        for a, b in spans:
-            buckets.setdefault(max(1, (b - a - 1).bit_length()) if b - a > 1 else 0, []).append((a, b))
-        self.buckets = []
-        small = []
-        for key in sorted(buckets):
-            sp = buckets[key]
-            Lb = max(b - a for a, b in sp)
-            nb = len(sp)
-            if nb < BATCH_MIN:
-                small += [np.arange(a, b) for a, b in sp]     # (a sweep along each of a few chains costs less one at a time)
-                continue
-            idx = np.full((Lb, nb), self.n, np.int64)            # (the padding reads index n: a zero)
-            for j, (a, b) in enumerate(sp):
-                idx[:b - a, j] = np.arange(a, b)
-            dp = np.append(d, 1.0)[idx]
-            ep = np.append(e, 0.0)[idx]
-            fp = np.append(f, 0.0)[idx]
-            # (the last sample of a chain has no band after it: the bands of the entry at a chain's end are already zero)
-            D = np.zeros((Lb, nb))
-            l1 = np.zeros((Lb, nb))
-            l2 = np.zeros((Lb, nb))
-            for k in range(Lb):
-                a_ = np.zeros(nb)
-                b_ = np.zeros(nb)
-                if k >= 2:
-                    b_ = fp[k - 2] / D[k - 2]
-                if k >= 1:
-                    a_ = (ep[k - 1] - (b_ * D[k - 2] * l1[k - 1] if k >= 2 else 0.0)) / D[k - 1]
-                l1[k], l2[k] = a_, b_
-                D[k] = dp[k] - a_ * a_ * (D[k - 1] if k >= 1 else 0.0) - b_ * b_ * (D[k - 2] if k >= 2 else 0.0)
-            if not (D[idx != self.n] > 0.0).all():
-                raise ValueError("the banded system is not positive definite")
-            self.buckets.append((idx, D, l1, l2))
-        self.small = np.concatenate(small) if small else None
-        self.small_fac = Banded(d[self.small], e[self.small], f[self.small]) if small else None
-
-    def solve(self, rhs):
-        out = np.zeros(self.n)
-        if self.small is not None:
-            out[self.small] = self.small_fac.solve(rhs[self.small])
-        rp = np.append(rhs, 0.0)
-        for idx, D, l1, l2 in self.buckets:
-            Lb = idx.shape[0]
-            y = rp[idx]
-            for k in range(1, Lb):
-                v = y[k] - l1[k] * y[k - 1]
-                if k >= 2:
-                    v = v - l2[k] * y[k - 2]
-                y[k] = v
-            y = y / D
-            for k in range(Lb - 2, -1, -1):
-                v = y[k] - l1[k + 1] * y[k + 1]
-                if k + 2 < Lb:
-                    v = v - l2[k + 2] * y[k + 2]
-                y[k] = v
-            sel = idx != self.n
-            out[idx[sel]] = y[sel]
-        return out
-
-
 class Heights:
     """Stage 5's answer for one system: zs (a height array per piece, as gradeshapes.solve_shape gives them), pieces, samples, stats."""
 
@@ -350,18 +238,76 @@ def _bandmul(d, e, f, v):
     return out
 
 
-def _dot(a, b):
-    return float(np.add.reduce(a * b))
+class Kkt:
+    """The sweeps' matrix H + sigma I + A' diag(rho) A as the upper triangle of a CSC matrix, its structure made once and its values
+    for any rho by one weighted sum (the same entries in the same order, so the same bits), and its factors: earthfast's SparseLdl
+    (QDLDL on an AMD ordering, the kernel's own pair), made at the first rho and redone on the same ordering at each new one. The
+    rows of A: the edges (z_b - z_a), the boxes (z_k), the curve windows (three entries wide)."""
+
+    def __init__(self, P, bn, c0, c1, c2):
+        N = P.N
+        m1, m2, m3 = len(P.A), len(bn), len(P.K0)
+        self.N = N
+        const = m1 + m2 + m3            # (the source row of the entries that do not scale with a row's rho)
+        rows, cols, coef, src = [], [], [], []
+
+        def add(r, c, w, s):
+            r = np.asarray(r, np.int64)
+            rows.append(r)
+            cols.append(np.asarray(c, np.int64))
+            coef.append(np.broadcast_to(np.asarray(w, np.float64), r.shape))
+            src.append(np.broadcast_to(np.asarray(s, np.int64), r.shape))
+        idx = np.arange(N, dtype=np.int64)
+        chain = np.searchsorted(np.array(P.off[1:], np.int64), idx, side="right")
+        add(idx, idx, P.hd + SIGMA, const)
+        i1 = idx[:-1][chain[:-1] == chain[1:]]
+        add(i1, i1 + 1, P.he[i1], const)
+        i2 = idx[:-2][chain[:-2] == chain[2:]]
+        add(i2, i2 + 2, P.hf[i2], const)
+        re = np.arange(m1, dtype=np.int64)
+        add(P.A, P.A, 1.0, re)
+        add(P.B, P.B, 1.0, re)
+        add(P.A, P.B, -1.0, re)             # (A < B: the upper triangle's row A of column B)
+        add(bn, bn, 1.0, m1 + np.arange(m2, dtype=np.int64))
+        if m3:
+            K0 = P.K0
+            rc = m1 + m2 + np.arange(m3, dtype=np.int64)
+            add(K0, K0, c0 * c0, rc)
+            add(K0 + 1, K0 + 1, c1 * c1, rc)
+            add(K0 + 2, K0 + 2, c2 * c2, rc)
+            add(K0, K0 + 1, c0 * c1, rc)
+            add(K0 + 1, K0 + 2, c1 * c2, rc)
+            add(K0, K0 + 2, c0 * c2, rc)
+        key = np.concatenate(cols) * N + np.concatenate(rows)
+        uniq, self.inv = np.unique(key, return_inverse=True)
+        self.inv = self.inv.reshape(-1)
+        self.coef = np.concatenate(coef)
+        self.src = np.concatenate(src)
+        self.indices = uniq % N
+        self.indptr = np.concatenate([[0], np.cumsum(np.bincount(uniq // N, minlength=N))]).astype(np.int64)
+        self.ldl = None
+        self.factorisations = 0
+
+    def factor(self, rv):
+        """Factors for the rows' weights rv (rho per row of A)."""
+        vals = np.bincount(self.inv, weights=self.coef * np.append(rv, 1.0)[self.src], minlength=len(self.indices))
+        if self.ldl is None:
+            self.ldl = fast.sparse_ldl(self.N, self.indptr, self.indices, vals)
+        else:
+            self.ldl.refactor(vals)
+        self.factorisations += 1
+
+    def solve(self, rhs):
+        return self.ldl.solve(rhs)
 
 
 def admm(P, z0, max_iter=MAX_ITER):
     """ADMM on the problem as OSQP has it (Stellato et al. 2020): minimise 1/2 x'Hx - h'x such that l <= Ax <= u, the rows of A the
-    edges' differences and the boxes. Each sweep: solve (H + sigma I + A' diag(rho) A) x~ = sigma x + h + A'(rho z - y) by preconditioned
-    conjugate gradients (the banded part of the matrix, the pieces' own bands and the grade edges between neighbours, factored
-    once for a rho and used as the preconditioner: the edges between pieces are what it iterates over), z~ = A x~, the relaxed
-    (alpha) averages, z <- the relaxed z + y/rho clipped to [l, u], y <- y + rho (relaxed z - z). Convergence: for every rho > 0 the
-    residuals go to zero and x to the minimiser (Boyd et al. 2011, section 3.2; the objective is strictly convex by W_MIN, the sets
-    closed convex). (z, stats)."""
+    edges' differences, the boxes and the curve windows. Each sweep: solve (H + sigma I + A' diag(rho) A) x~ = sigma x + h + A'(rho z - y)
+    exactly (a sparse LDL' on a fill-reducing ordering, factored once for a rho: Kkt), z~ = A x~, the relaxed (alpha) averages,
+    z <- the relaxed z + y/rho clipped to [l, u], y <- y + rho (relaxed z - z). Convergence: for every rho > 0 the residuals go to
+    zero and x to the minimiser (Boyd et al. 2011, section 3.2; the objective is strictly convex by W_MIN, the sets closed convex).
+    (z, stats)."""
     N = P.N
     A, B = P.A, P.B
     floor, ceil = implied_bounds(P.cons.g)
@@ -378,35 +324,17 @@ def admm(P, z0, max_iter=MAX_ITER):
     Lw = np.r_[P.DLO, lo[bn], -P.CB]
     Uw = np.r_[P.DHI, hi[bn], P.CB]
     eq = (Uw - Lw) <= 1e-9
-    chain = np.searchsorted(np.array(P.off[1:], np.int64), np.arange(N), side="right")
-    local = (B == A + 1) & (chain[A] == chain[B])
-    Al, Bl = A[local], B[local]
-    Ac, Bc = A[~local], B[~local]
-    cmask = ~local
     x = np.clip(np.asarray(z0, np.float64), lo, hi)
     Ax = np.r_[x[B] - x[A], x[bn], Cmul(x)]
     z = np.minimum(np.maximum(Ax, Lw), Uw)
     y = np.zeros(m1 + m2 + m3)
     rho = RHO0
-    stats_pcg = 0
+    kkt = Kkt(P, bn, c0, c1, c2)
 
     def factor(rho):
         rv = np.where(eq, RHO_EQ * rho, rho)
-        rp, rb, rc = rv[:m1], rv[m1:m1 + m2], rv[m1 + m2:]
-        d = P.hd + SIGMA
-        e = P.he.copy()
-        f = P.hf.copy()
-        d = d + np.bincount(Al, weights=rp[local], minlength=N) + np.bincount(Bl, weights=rp[local], minlength=N)
-        d[bn] += rb
-        e[Al] += -rp[local]
-        if m3:                              # (the curve rows' normal matrix: inside the three bands)
-            d[K0] += rc * c0 * c0
-            d[K1] += rc * c1 * c1
-            d[K2] += rc * c2 * c2
-            e[K0] += rc * c0 * c1
-            e[K1] += rc * c1 * c2
-            f[K0] += rc * c0 * c2
-        return rv, d, e, f, BandedBatch(d, e, f, P.off)
+        kkt.factor(rv)
+        return rv
 
     def Aty(w):
         out = np.bincount(B, weights=w[:m1], minlength=N) - np.bincount(A, weights=w[:m1], minlength=N) + np.bincount(bn, weights=w[m1:m1 + m2], minlength=N)
@@ -415,43 +343,14 @@ def admm(P, z0, max_iter=MAX_ITER):
             out = out + np.bincount(K0, weights=wc * c0, minlength=N) + np.bincount(K1, weights=wc * c1, minlength=N) + np.bincount(K2, weights=wc * c2, minlength=N)
         return out
 
-    rv, bd, be, bf, fac = factor(rho)
-    xt = x.copy()
+    rv = factor(rho)
     rescalings = 0
     it = 0
     r_pri = r_dual = math.inf
     converged = False
     while it < max_iter:
         it += 1
-        rhs = SIGMA * x + P.h + Aty(rv * z - y)
-
-        def Kmul(v):
-            out = _bandmul(bd, be, bf, v)
-            if len(Ac):
-                w = rv[:m1][cmask] * (v[Bc] - v[Ac])
-                out = out + np.bincount(Bc, weights=w, minlength=N) - np.bincount(Ac, weights=w, minlength=N)
-            return out
-        # (preconditioned conjugate gradients, warm from the last x~)
-        r = rhs - Kmul(xt)
-        scale = max(float(np.abs(rhs).max(initial=0.0)), 1.0)
-        # (inexact solves, as OSQP's indirect solver: as tight as a twentieth of the dual residual, never looser than the floor)
-        tol = max(PCG_TOL * scale, PCG_REL * (r_dual if math.isfinite(r_dual) else scale))
-        for _k in range(PCG_MAX):
-            if float(np.abs(r).max(initial=0.0)) <= tol:
-                break
-            zz = fac.solve(r)
-            if _k == 0:
-                p = zz
-                rz = _dot(r, zz)
-            else:
-                rz_new = _dot(r, zz)
-                p = zz + (rz_new / rz) * p
-                rz = rz_new
-            Kp = Kmul(p)
-            a = rz / _dot(p, Kp)
-            xt = xt + a * p
-            r = r - a * Kp
-            stats_pcg += 1
+        xt = kkt.solve(SIGMA * x + P.h + Aty(rv * z - y))
         zt = np.r_[xt[B] - xt[A], xt[bn], Cmul(xt)]
         xr = ALPHA * xt + (1.0 - ALPHA) * x
         zr = ALPHA * zt + (1.0 - ALPHA) * z
@@ -459,12 +358,11 @@ def admm(P, z0, max_iter=MAX_ITER):
         y = y + rv * (zr - z_new)
         x, z = xr, z_new
         Ax = np.r_[x[B] - x[A], x[bn], Cmul(x)]
-        Px =_bandmul(P.hd, P.he, P.hf, x)
+        Px = _bandmul(P.hd, P.he, P.hf, x)
         ATy = Aty(y)
         r_pri = float(np.abs(Ax - z).max(initial=0.0))
         r_dual = float(np.abs(Px - P.h + ATy).max(initial=0.0))
-        eps_dual = DUAL_ABS
-        if r_pri <= TOL_M and r_dual <= eps_dual:
+        if r_pri <= TOL_M and r_dual <= DUAL_ABS:
             converged = True
             break
         if it % RHO_EVERY == 0 and rescalings < MAX_RHO:
@@ -475,9 +373,9 @@ def admm(P, z0, max_iter=MAX_ITER):
             ratio = math.sqrt(pn / max(dn, 1e-30))
             if ratio > 5.0 or ratio < 0.2:
                 rho = min(max(rho * ratio, 1e-6), 1e8)
-                rv, bd, be, bf, fac = factor(rho)
+                rv = factor(rho)
                 rescalings += 1
-    stats = dict(iterations=it, pcg_iterations=stats_pcg, rho=rho, rho_rescalings=rescalings, primal_residual_m=r_pri,
+    stats = dict(iterations=it, factorisations=kkt.factorisations, rho=rho, rho_rescalings=rescalings, primal_residual_m=r_pri,
                  dual_residual=r_dual, converged=converged)
     return x, stats
 
@@ -494,7 +392,7 @@ def constraints_of(net, sysm, pcs, smp, gl, fixed_z, at=None, spacing="true"):
     if at is not None:
         base = ia.Constraints(net, sysm, pcs, smp, gl, fixed_z, spacing, problem)
         ground = type("G", (), {"at": staticmethod(lambda m, s: at(m, s)), "fixed": staticmethod(fixed_z)})
-        hs = s4.holds_of(net, sysm, pcs, smp, ground, base.node, gl)
+        hs = s4.holds_of(net, sysm, pcs, smp, ground, base.node)
     return s4.Constraints(net, sysm, pcs, smp, gl, fixed_z, spacing, problem, hs)
 
 

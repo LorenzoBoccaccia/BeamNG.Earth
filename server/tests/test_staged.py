@@ -280,6 +280,35 @@ def test_a_street_over_a_tunnels_footprint_takes_its_height_from_its_anchors_not
     assert not pts
 
 
+def test_a_street_part_wholly_over_a_tunnel_takes_its_anchors_from_the_road_beyond_its_ends():
+    """Porte Maillot (LiDAR, 48.8798 N 2.2813 E): the primary road's part that starts at the point on the slab lies wholly over the
+    trench, so its own part has no point outside the footprint and the elevation, the trench floor (30.7 m), stood 7 m under the street
+    (37.6 m). Its anchors are the first ground points of the road beyond its ends, through the joints."""
+    tun = road(("t", "tunnel", 0), line(0, 0, 200, 0, 40), "tunnel", "trunk", -1.0, half=7.0)
+    west = road(("w", "ground", 0), line(100, -120, 100, -10, 20), cls="secondary", half=5.0)
+    mid = road(("m", "ground", 0), line(100, -10, 100, 10, 6), cls="secondary", half=5.0)
+    east = road(("e", "ground", 0), line(100, 10, 100, 120, 20), cls="secondary", half=5.0)
+    portal = road(("p", "ground", 0), line(-120, 0, 0, 0, 30), cls="trunk", half=7.0)
+
+    def terrain(xy):
+        xy = np.atleast_2d(xy)
+        trench = (np.abs(xy[:, 1]) < 9.0) & (xy[:, 0] > 0.0) & (xy[:, 0] < 200.0)
+        return np.where(trench, -7.0, 0.5 * xy[:, 1] / 120.0)
+    pl = places.synthetic([tun, west, mid, east, portal], ground=terrain)
+    net = pl.net
+    idx = {m.key[0]: i for i, m in enumerate(net.m)}
+    fp = s3.footprints(net)
+    mi = idx["m"]
+    assert mi in fp and fp[mi][0][0] <= 0.0 and fp[mi][0][1] >= net.L[mi]          # (wholly over the footprint)
+    fixed = s3.anchored(net, pl.ground.fixed)
+    mid_s = net.L[mi] / 2.0
+    assert float(pl.ground.fixed(mi, mid_s)) == -7.0                                # (the elevation: the trench floor)
+    # (the line between the first ground points of the road beyond each end: the street's own level a metre either side of the trench)
+    got = float(fixed(mi, mid_s))
+    assert abs(got - 0.0) < 0.6, got
+    assert abs(float(fixed(mi, 0.0)) - float(fixed(mi, net.L[mi]))) < 1.5            # (a slope of the road's own ground, not a step to the floor)
+
+
 def test_one_road_twice_with_another_smoothing_is_one_segment():
     ln1 = line(0, 0, 400, 0, 9)
     ln2 = np.stack([np.linspace(0, 400, 25), 0.8 * np.sin(np.linspace(0, np.pi, 25))], axis=1)     # the same road, 0.8 m off along its middle
@@ -546,3 +575,30 @@ def test_shanghai_yanan_west_names_the_contradiction_of_the_map():
     cmp_ = staged.compare(S, pl.today, pl.net)
     assert cmp_["staged_sizes"][0][0] < cmp_["today_sizes"][0][0] and S.P.cleaned.collapsed
     assert len(S.G.ramps) > 50
+
+
+def test_a_trap_is_looked_up_in_the_map_before_it_is_a_failure():
+    """Traffic arrives at a joint of one-way roads and none of its roads takes it on: what the map has at that node decides. A road of it
+    that does, one the joint's members leave out (Prague's, A61's: a road in a cell not read; Bologna's: a two-way road no member is), is
+    a note; one that is a member whose line stops 3.8 m short of the node (Prague's Brnenska) is joined to it across the gap, and the
+    traffic goes on; where nothing at that node takes it on the ways' directions disagree (the map's, named, no failure)."""
+    a = road(("a", "ground", "a"), line(0, 0, 100, 0))
+    b = road(("b", "ground", "b"), line(200, 0, 100, 0))           # both flow into the joint at x = 100
+    meta = {"a": dict(oneway=True, dir=1), "b": dict(oneway=True, dir=1), "c": dict(oneway=True, dir=1)}
+    base = dict(near=[], inside=[], others=[], connector="n1", feature_end=1, own_gap=None, own_next=None)
+    taker = ("x", "trunk", "0", "w9", False, 0, dict(oneway=True, dir=1))        # (a road at the node whose traffic enters from it)
+
+    def run(members, facts_of):
+        pl = places.synthetic(members, meta=meta)
+        return staged.run(pl.members, pl.meta, None, None, pl.ground, feasibility=False,
+                          endinfo=lambda i, e: facts_of(pl.members[i].key[0], e))
+    nobody = run([a, b], lambda k, e: dict(base))
+    assert not nobody.fails(1) and [f.level for f in nobody.finds[1] if f.code == "oneway_map"] == ["map"]
+    outside = run([a, b], lambda k, e: dict(base, others=[taker]))
+    assert not outside.fails(1) and [f.level for f in outside.finds[1] if f.code == "oneway_taken_outside"] == ["note"]
+    # (the road that takes it on is a member whose line starts 3.8 m off the joint: the map has it at that node, its line stops short)
+    c = road(("c", "ground", "c"), line(100, 3.8, 100, 150))
+    node = ("c", "trunk", "0", "w10", False, 0, dict(oneway=True, dir=1))
+    joined = run([a, b, c], lambda k, e: dict(base, others=[node]) if (k, e) in (("a", 1), ("b", 1)) else dict(base))
+    assert not joined.fails(1) and "node_join" in codes(joined, 1, "note") and "oneway_trap" not in codes(joined, 1)
+    assert len(joined.P.paths) == 2 and all(p.flow == 1 for p in joined.P.paths)

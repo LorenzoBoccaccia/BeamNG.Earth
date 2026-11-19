@@ -17,7 +17,10 @@ of a piece: a deck whole, a road going under through its window; interchange_aud
               ground;
   ground held a point found on the ground (stage 3) is at the ground's height: the road on the ground leading to a deck's end
               is its embankment, as steep as that road's grade and RAMP_MAX_M long, so the deck's end is within grade x that of
-              the ground there; a road going under returns to its ground at the ends of its window.
+              the ground there. (Not a road going under's window ends: the shapes' own ceiling is the ground there and the road may
+              end its window under it, the plan grading a cut from it up to the ground; holding it within SOFT_M of the ground made
+              Compiegne's roundabout infeasible in staged only, a hold floor 0.85 m over its ceiling, and put A61's road going under
+              1.7 m from the kernel's answer and 12 steps worse.)
 The curves (second differences) are not differences: a graph with no negative cycle is necessary for the shape, not sufficient
 (stage 5 decides the curves). A deck running along another without crossing it (gradeshapes._stacked) is not here either.
 
@@ -80,7 +83,7 @@ def _available(segs):
     return sum(abs(s1 - s0) for _j, s0, s1 in segs)
 
 
-def holds_of(net, sysm, pcs, smp, ground, cons_node, gl=None):
+def holds_of(net, sysm, pcs, smp, ground, cons_node):
     """The points held on the ground: [Hold]. cons_node(piece, sample) -> node of the constraint graph."""
     out = []
     piece = {pc["main"]: p for p, pc in enumerate(pcs) if pc["kind"] == "deck"}
@@ -112,22 +115,6 @@ def holds_of(net, sysm, pcs, smp, ground, cons_node, gl=None):
         out.append(Hold(cons_node(piece[i], k), zg_lo - gs.SOFT_M, zg_hi + gs.SOFT_M, i, si,
                         "its end's embankment on %s reaches the ground within %.0f m, at %.1f%% (ground %.2f to %.2f m by then)"
                         % (str(net.m[j].cls), run, 100.0 * g, zg_lo, zg_hi)))
-    dips = iter(sysm["dips"])
-    for p, pc in enumerate(pcs):
-        if pc["kind"] != "dip":
-            continue
-        d, a, b = next(dips)
-        # (a window the road's end cut short, at a dead end or another structure, never reached its ground: it holds nothing)
-        if _available(pc["segs"]) < (b - a) - 1e-6:
-            continue
-        x = smp[p]
-        for e in (0, len(x["ms"]) - 1):
-            m, s = int(x["mem"][e]), float(x["ms"][e])
-            if any(q != p and gs._locate(smp, q, m, s) is not None for q in gs._pieces_of(smp, m)):
-                continue            # (the road goes on under another window there: not the end of its dip)
-            zg = float(gl[p][e]) if gl is not None else float(ground.at(m, s))     # (the ground the problem has under that sample: its ceiling is the same number)
-            out.append(Hold(cons_node(p, e), zg - gs.SOFT_M, zg, m, s,
-                            "the window of a road going under returns to its ground, %.2f m (within the %.1f m the plan's own grading takes it)" % (zg, gs.SOFT_M)))
     return out
 
 
@@ -143,7 +130,7 @@ def build(net, sysm, ground, spacing="true", holds=True):
     problem = gs.shape_problem(net, sysm, pcs, smp, gl, fixed, trace) + (trace,)
     if holds:
         base = ia.Constraints(net, sysm, pcs, smp, gl, fixed, spacing, problem)
-        hs = holds_of(net, sysm, pcs, smp, anchor, base.node, gl)
+        hs = holds_of(net, sysm, pcs, smp, anchor, base.node)
     else:
         hs = []
     return Constraints(net, sysm, pcs, smp, gl, fixed, spacing, problem, hs), pcs, smp

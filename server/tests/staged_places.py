@@ -34,7 +34,7 @@ def synthetic(members, ground=None, meta=None, name="synthetic"):
                            trace=None, audits=None, home=None)
 
 
-def replay(name):
+def replay(name, prefix="interchange"):
     """A replay of tests/interchanges.py (fixtures/interchange_NAME.npz) planned as the server plans it with every solve replaced
     by the audit's capture: the members the planner finds, what the map has of each road, the ground along them, today's systems."""
     from unittest import mock
@@ -42,7 +42,7 @@ def replay(name):
     import interchanges
     import mapcells
     import revisit
-    rep = interchanges.load(name)
+    rep = interchanges.load(name, prefix=prefix)
     with mock.patch.object(revisit, "ON", False):
         planner = run.planner_of(rep)
         home = mapcells.cell_of(*rep.origin)
