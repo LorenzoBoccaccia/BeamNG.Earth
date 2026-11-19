@@ -777,6 +777,18 @@ class RailwayTest(unittest.TestCase):
 
 
 
+class DeckReachTest(unittest.TestCase):
+    def test_a_decks_least_height_is_what_the_others_ends_run_out_to_along_the_track(self):
+        # Compiegne's two bridges 25 m apart on one embankment: the second's ground read 2.9 m lower than the first's deck
+        # (the DEM under it is interpolated, the LiDAR HD's 40.4 m is the embankment's), but the track between them is one
+        # line that falls no faster than GRADE: the second deck stands at least the first's end less GRADE per metre
+        lines = [np.array([[0.0, 0.0], [20.0, 0.0]]), np.array([[20.0, 0.0], [60.0, 0.0]]), np.array([[60.0, 0.0], [80.0, 0.0]])]
+        _nodes, edges, adj = roads._chain_graph(lines)
+        reach = railways._deck_reach(edges, adj, {0: np.array([10.0, 10.0]), 2: np.array([5.0, 5.0])}, [0, 2])
+        np.testing.assert_allclose(reach[2], [10.0 - railways.GRADE * 40.0, 10.0 - railways.GRADE * 60.0])
+        np.testing.assert_allclose(reach[0], [10.0, 10.0])
+
+
 class RoadUnderpassTest(unittest.TestCase):
     """A tunnel flag on the lower road must also keep the railway above it open."""
 

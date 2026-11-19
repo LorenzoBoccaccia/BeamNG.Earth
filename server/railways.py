@@ -1668,6 +1668,23 @@ def _profile(rails, ground, underpasses=()):
             ends.setdefault(b, []).append(zb[n][-1])
     seeds = {}                                  # node -> the deck's height at it
     inner = _inner_nodes(rails, edges, zgs, ends, level)
+
+    def own_deck(n):
+        """The deck n's heights from the ground at its ends (before any road's clearance)."""
+        a, b, _ = edges[n]
+        sx = _arc(rails[n][3])
+        za = inner[a] if a in inner else float(np.mean(ends[a])) if a in ends else float(zgs[n][0])
+        zb_ = inner[b] if b in inner else float(np.mean(ends[b])) if b in ends else float(zgs[n][-1])
+        za = max(za, level[a][0]) if a in level and a not in inner else za          # (the track's level beyond its ends)
+        zb_ = max(zb_, level[b][0]) if b in level and b not in inner else zb_
+        return sx, deck_heights(sx, zgs[n], za, zb_)
+
+    # (a deck's height is not its ground's alone: the track is one line, and the other decks' ends run out along it at
+    # GRADE (_stepless): the least the deck will have, whatever its crossings' verdicts)
+    reach = {}
+    if STEPLESS_ON and decks and underpasses:
+        own = {n: own_deck(n)[1] for n in decks}
+        reach = _deck_reach(edges, adj, own, decks)
     for n, ((_, cls, kind, xy), (a, b, _)) in enumerate(zip(rails, edges)):
         if kind == "tunnel":                    # (straight between its portals' beds, whatever the hill above it)
             g = zgs[n]
@@ -1692,7 +1709,7 @@ def _profile(rails, ground, underpasses=()):
             if crossings[c][4] is not None:
                 # (a plain way: the bridge rises over it, or the way goes under the track (grading's underpass), by
                 # findground: the lack is what the bed falls short by, the run the bridge has to its structure's ends
-                lack = want - zb[n][over]
+                lack = want - (np.maximum(zb[n][over], reach[n][over]) if n in reach else zb[n][over])
                 k = int(np.argmax(lack))
                 ends_m, end_nodes = _structure_run(rails, edges, ends, n, float(np.mean(sx[over])))     # (the road's own crossing)
                 rise = crossings[c][5]
@@ -1806,6 +1823,25 @@ def _inner_nodes(rails, edges, zgs, ends, level):
 STEPLESS_ON = os.environ.get("BNE_RAIL_STEPLESS", "on") != "off"
 STEPLESS_PASSES = 6
 STEPLESS_TOL_M = 0.005
+
+
+def _deck_reach(edges, adj, zb, decks):
+    """{deck: heights along it} the least each deck has from the others': every deck's end (zb: deck -> its heights) run
+    out along the track's chain graph (edges, adj) at GRADE per metre, as _stepless floors them."""
+    seeds = {}
+    for n in decks:
+        a, b, _s = edges[n]
+        for node, h in ((a, zb[n][0]), (b, zb[n][-1])):
+            seeds[node] = max(seeds.get(node, -np.inf), float(h))
+    if not seeds:
+        return {}
+    top = max(seeds.values())
+    d = roads._dijkstra(adj, {node: (top - h) / GRADE for node, h in seeds.items()})
+    out = {}
+    for n in decks:
+        a, b, s = edges[n]
+        out[n] = np.maximum(top - GRADE * (d[a] + s), top - GRADE * (d[b] + s[-1] - s))
+    return out
 
 
 def _stepless(rails, edges, adj, zb, ends):
