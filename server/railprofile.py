@@ -27,19 +27,11 @@ import revisit
 import roads
 
 ENABLED = os.environ.get("BNE_RAIL_PROFILE", "on") not in ("off", "0", "false")
-SMOOTH_ON = os.environ.get("BNE_RAIL_SMOOTH", "on") not in ("off", "0", "false")
 NODE_M = roads.TILE                 # m between the nodes (a tile corner each)
 MARGIN_M = 350.0                    # m of line taken round a node's support (+-NODE_M) for its profile
-SMOOTH_STEPS = 25                   # steps (STEP_M each) either side the ground beds are averaged over, twice more
-MAX_CUT_M = 3.0                     # m the long smoothing moves a bed at most (cuttings and embankments stay modest)
-PIN_M = 30.0                        # m from a part's end the bed is left as railways.profile made it (a joint, a deck)
 # A point of a line the node's window split into other parts than the asking window's (no exact key: _find) takes the
 # node's nearest points of the same line (_find_near); off with BNE_RAIL_FIND_NEAR=off.
 FIND_NEAR_ON = os.environ.get("BNE_RAIL_FIND_NEAR", "on") not in ("off", "0", "false")
-JOIN_ON = os.environ.get("BNE_RAIL_SWITCH_FIX", "on") not in ("off", "0", "false")
-JOIN_M = 2.0                        # m: a ground part's end this near another part's line (not near its ends) is a switch
-JOIN_INTERIOR_M = 3.0               # m: ... farther than this from the other part's own ends (that is a joint: profile's)
-JOIN_REACH_M = 60.0                 # m along the part the bed is brought to the other's (to nothing, smoothly)
 NODE_MEMO_POINTS = 3_000_000        # points kept in the nodes (~16 bytes a point: _node's arrays), least recently used
                                     # let go. A node is pure in (anchor, node) since its ground is the DEM's (the deck
                                     # ground order-free: grading._deck_ground), so the number kept no longer changes a
@@ -62,59 +54,11 @@ def _pack(a, b):
     return ((np.asarray(a, np.int64) + _PACK) << 32) | (np.asarray(b, np.int64) + _PACK)
 
 
-def smooth(xy, zb):
-    """A ground part's bed (railways.profile's: ground heights averaged over 20 m) averaged again over SMOOTH_STEPS either
-    side, twice: a railway rides no bump of the DEM (a main line's vertical curves are kilometres long). It moves the bed
-    by MAX_CUT_M at most, and not at all at the part's ends (PIN_M: a joint with another part, a deck's ramp). A part of
-    fewer than 8 points as it is. (earthfast.rail_bed_smooth)"""
-    zb = np.asarray(zb, np.float64).ravel()
-    xy = np.asarray(xy, np.float64).reshape(-1, 2)
-    return _smooth_flat(xy, np.array([0, len(zb)], np.int64), zb, np.ones(1, bool))
-
-
 def _flat(rails):
     """(xy (n, 2), off (parts + 1,)) of the parts of rails [(fid, class, kind, xy)] end to end, for the kernels."""
     xys = [np.asarray(r[3], np.float64).reshape(-1, 2) for r in rails]
     off = np.r_[0, np.cumsum([len(x) for x in xys], dtype=np.int64)].astype(np.int64)
     return (np.ascontiguousarray(np.vstack(xys)) if xys else np.zeros((0, 2))), off
-
-
-def _smooth_flat(xy, off, z, which):
-    fast.require(209, "rail_bed_smooth")
-    return fast._ef.rail_bed_smooth(np.ascontiguousarray(xy, np.float64), np.ascontiguousarray(off, np.int64),
-                                    np.ascontiguousarray(z, np.float64), np.ascontiguousarray(which, bool),
-                                    SMOOTH_STEPS, MAX_CUT_M, PIN_M)
-
-
-def _join_flat(rails, xy, off, z, inside):
-    """join_beds of the beds z (end to end, as _flat's xy / off) of rails: the beds end to end."""
-    fast.require(209, "rail_join_beds")
-    ids = {}
-    group = np.array([ids.setdefault(r[0], len(ids)) for r in rails], np.int64)
-    elig = np.array([k == "ground" and c != "tram" for _f, c, k, _xy in rails], bool)
-    box = tuple(float(v) for v in inside) if inside is not None else (math.nan,) * 4
-    return fast._ef.rail_join_beds(xy, off, np.ascontiguousarray(z, np.float64), group, elig, box, JOIN_M,
-                                   JOIN_INTERIOR_M, JOIN_REACH_M)
-
-
-def join_beds(rails, zbs, inside=None):
-    """zbs (the ground parts' beds, one array per part of rails [(fid, class, kind, xy)]) with each part's end that lies on
-    another part's line (a switch: a siding, a crossover's end; JOIN_M from it, JOIN_INTERIOR_M from its ends) brought
-    to that part's bed there: the difference run out along the part over JOIN_REACH_M (a part tied at both ends over its
-    whole length, a smooth blend of the two). railways.profile and smooth lay a short part's bed from its own ground, 0.45 m
-    over and 0.58 m under the main lines a crossover joins at Kalynivka, a step across the rails (plan 040). inside:
-    (x0, y0, x1, y1) the window; an end outside it is a clipped one, left alone. A crossover tied at both ends and no
-    longer than twice JOIN_REACH_M is a straight grade between the two beds it joins (its own ground's bumps between them
-    were 0.3 m over the lines). Pure (earthfast.rail_join_beds)."""
-    if not JOIN_ON:
-        return zbs
-    zs = [np.asarray(z, np.float64).ravel() for z in zbs]
-    if not zs:
-        return []
-    xy, off = _flat(rails)
-    if len(zs) != len(rails) or any(len(z) != int(off[k + 1] - off[k]) for k, z in enumerate(zs)):
-        raise ValueError("join_beds: one bed per part, a height per point")
-    return np.split(_join_flat(rails, xy, off, np.concatenate(zs), inside), off[1:-1])
 
 
 _NEIGHBOURS = ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1))
@@ -213,12 +157,6 @@ def _make_node(frame, load, ground, ix, iy):
         tunnels = railways.raising_underpasses(tunnels, tcls) + railways.plain_underpasses(frame, cells, box, rails, reach, tunnels)
         xy, off = _flat(rails)
         z = np.concatenate([np.asarray(zb, np.float64).ravel() for zb, _zg in railways.profile(rails, ground, tunnels)])
-        if SMOOTH_ON:
-            z = _smooth_flat(xy, off, z, np.array([kind == "ground" for _f, _c, kind, _xy in rails], bool))
-        inner = (box[0] - reach + 3 * railways.STEP_M, box[1] - reach + 3 * railways.STEP_M,
-                 box[2] + reach - 3 * railways.STEP_M, box[3] + reach - 3 * railways.STEP_M)
-        if JOIN_ON:
-            z = _join_flat(rails, xy, off, z, inner)
         cm = _cm(xy)
         packed = _pack(cm[:, 0], cm[:, 1])
         by = {}

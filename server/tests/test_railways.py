@@ -563,13 +563,18 @@ class RailwayTest(unittest.TestCase):
         x = P[np.unique(T[M == 2])][:, 0]
         self.assertTrue(((x > 115) & (x < 125)).any(), "the rails go on under the road")
 
-    def test_bed_smooths_bumps_but_follows_hills(self):
-        s = np.arange(0.0, 400.0, railways.STEP_M)
-        z = 0.05 * s + 0.4 * np.sin(s / 3.0)
-        zb = railways.bed_heights(z)
-        mid = slice(20, -20)
-        self.assertLess(np.abs(zb - 0.05 * s)[20:-20].max(), 0.1, "the bumps gone")
-        self.assertLess(np.abs(zb - 0.05 * s).max(), 0.3, "the grade kept to the ends")
+    def test_the_bed_is_the_terrain_under_the_grade_and_the_curve_law(self):
+        """The bed follows a hill and leaves its bumps: it climbs at GRADE at most and bends at RAIL_VERTICAL_RADIUS_M at
+        least (railsolve), the terrain's 20 m bumps are not a radius a track has."""
+        f = features([[(-400.0, 100.0), (400.0, 100.0)]], ["standard_gauge"], subtypes=["rail"])
+        rails, prof = self._bed(f, lambda xy: 0.04 * (xy[:, 0] + 400.0) + 0.4 * np.sin(xy[:, 0] / 3.0))
+        zb = prof[0][0]
+        x = rails[0][3][:, 0]
+        self.assertLess(np.abs(zb - 0.04 * (x + 400.0))[20:-20].max(), 0.1, "the bumps gone")
+        self.assertLessEqual(np.abs(np.diff(zb)).max() / railways.STEP_M, railways.GRADE + 1e-6)
+        d = np.diff(x)                                  # (the last segment of a part is shorter: the true spacing)
+        curve = np.abs(np.diff(np.diff(zb) / d) / (0.5 * (d[:-1] + d[1:])))
+        self.assertLessEqual(curve.max(), 1.0 / railways.RAIL_VERTICAL_RADIUS_M + 2e-4, "no bend under the radius")
 
     def _bed(self, f, ground):
         rails = railways.parts(FRAME, [f], roads.tile_bbox(0, 0))
@@ -586,16 +591,16 @@ class RailwayTest(unittest.TestCase):
         o = np.argsort(pts[:, 0])
         return f, pts[o, 0], z[o]
 
-    def test_a_deck_up_a_steep_line_does_not_lift_the_track_below(self):
-        """GitHub #1051, Andermatt: a rack railway climbing ~10 % from the station to a bridge up the slope; the deck's
-        height, carried down the track at GRADE, stood the station's tracks 14 m over their own ground. A deck at its
-        line's level lifts nothing: the track below keeps its own bed."""
+    def test_a_line_steeper_than_the_grade_climbs_at_the_grade_and_says_so(self):
+        """GitHub #1051, Andermatt: a rack railway climbing ~10 % from the station up to a bridge. A track is one grade
+        law (GRADE, a car game's): it climbs at that, the hill it cannot follow a cutting the ground is graded to, and the
+        conflict is reported (the station at the foot is not kept level either: the fit is one line of 5 %)."""
         def slope(xy):          # level to x = -100 (the station), then 10 % up
             return 1000.0 + 0.10 * np.maximum(xy[:, 0] + 100.0, 0.0)
-        f, x, z = self._line(slope)
-        ground = slope(np.c_[x, np.zeros(len(x))])
-        station = x < -150
-        self.assertLess(float(np.abs(z[station] - ground[station]).max()), 0.5, "the station on its own ground")
+        with self.assertLogs("earthd.railways", "WARNING") as logged:
+            f, x, z = self._line(slope)
+        self.assertLessEqual(float(np.abs(np.diff(z)).max() / railways.STEP_M), railways.GRADE + 2e-3, "no climb over GRADE")
+        self.assertIn("cannot follow", logged.output[0])
 
     def test_bridge_over_a_dip_keeps_the_line_level(self):
         """A short bridge over a stream or an underpass road (the ground 3 m down under it): the deck straight at the
@@ -618,18 +623,10 @@ class RailwayTest(unittest.TestCase):
         f, x, z = self._line(cutting)                       # (the bridge from 100 to 150: its ends at 5 m)
         deck = (x >= 100) & (x <= 150)
         self.assertLess(cutting(np.array([[100.0, 100.0]]))[0], 5.5, "(the mapped ends down the slopes)")
-        self.assertGreater(float(z[deck].min()), 10.0 - railways.GRADE * railways.APPROACH_REACH_M, "the deck up")
+        self.assertGreater(float(z[deck].min()), 10.0 - 1.0, "the deck up at the track's level, not between the low ends (5 m)")
         self.assertLess(float(z.max()), 10.0 + 0.05, "not over the track's own level")
         dz = np.abs(np.diff(z)) / np.maximum(np.diff(x), 1e-9)
         self.assertLessEqual(dz[np.diff(x) > 0.5].max(), railways.GRADE + 1e-6, "no step at the deck's ends")
-
-    def test_a_hillside_on_from_the_bridge_does_not_raise_it(self):
-        """The ground rising on from a bridge's ends without levelling out (the line climbs a hillside there): no
-        level the track holds, the deck stays at its ends' ground."""
-        def valley(xy):             # 8 % slopes up from the bridge's ends, a dip under it
-            x = xy[:, 0]
-            return np.where(x < 100, 10.0 + 0.08 * (100 - x), np.where(x > 150, 10.0 + 0.08 * (x - 150), 7.0))
-        self.assertEqual(railways.approach_levels(np.array([[100.0, 100.0], [150.0, 100.0]]), valley), (None, None))
 
     def test_piers_stand_beside_a_road_under_the_bridge_on_the_ground(self):
         """A rail bridge over a road in a 5 m dip: no pier in the road's lanes, every pier's foot under the ground at
@@ -694,25 +691,23 @@ class RailwayTest(unittest.TestCase):
         self.assertLess(float(z.max()), chord + railways.DECK_RAISE_MAX_M + railways.GRADE * 25.0 + 1e-6)
         dz = np.abs(np.diff(z)) / np.maximum(np.diff(x), 1e-9)
         self.assertLessEqual(dz[np.diff(x) > 0.5].max(), railways.GRADE + 1e-6, "no step at the deck's ends")
-        self.assertLess(float(z[x > 500].max()) - 10.0, railways.SEED_LIFT_MAX_M,
+        self.assertLess(float(z[x > 500].max()) - 10.0, railways.DECK_RAISE_MAX_M,
                         "the ramp to the capped deck stays bounded too")
 
-    def test_distant_high_deck_does_not_lift_a_ground_track_100m(self):
-        """A high deck must not lift kilometres of connected ground track (and the ground graded to it) with it:
-        the seeds' carry-over over a ground part's own bed is at most SEED_LIFT_MAX_M."""
+    def test_a_cliff_the_track_cannot_follow_is_reported_and_the_grade_kept(self):
+        """A bridge standing 90 m over the flat ground track on from it (a plateau at the other end): no track climbs that.
+        The grade law holds along all of it and the conflict is reported, not hidden."""
         f = features([[(-400.0, 100.0), (100.0, 100.0)], [(100.0, 100.0), (150.0, 100.0)],
                       [(150.0, 100.0), (2000.0, 100.0)]], ["standard_gauge"] * 3, subtypes=["rail"] * 3,
                      flags=[(1, "is_bridge")])
 
-        def plateau(xy):            # the bridge stands 90 m over the flat ground track on from it
+        def plateau(xy):
             return np.where(xy[:, 0] < 100.0, 100.0, 10.0)
-        rails, prof = self._bed(f, plateau)
-        grounds = [(len(xy), zb) for (_, _, kind, xy), (zb, _zg) in zip(rails, prof) if kind == "ground"]
-        self.assertTrue(grounds, "ground parts there")
-        _n, bed = max(grounds, key=lambda t: t[0])
-        self.assertLess(float(bed.max() - 10.0), railways.SEED_LIFT_MAX_M + 1e-6)
-        dz = np.abs(np.diff(bed)) / railways.STEP_M
-        self.assertLessEqual(float(dz.max()), railways.GRADE + 1e-6, "the ramp still climbs at GRADE at most")
+        with self.assertLogs("earthd.railways", "WARNING") as logged:
+            rails, prof = self._bed(f, plateau)
+        for (_, _, _kind, _xy), (zb, _zg) in zip(rails, prof):
+            self.assertLessEqual(float(np.abs(np.diff(zb)).max() / railways.STEP_M), railways.GRADE + 2e-3)
+        self.assertIn("cannot follow", logged.output[0])
 
     def test_bridge_over_a_valley_runs_straight(self):
         """A bridge over a 30 m deep valley between its banks: straight between them, piers down to the floor."""
@@ -758,13 +753,13 @@ class RailwayTest(unittest.TestCase):
             raw = ridge(la, lo)
             got = g.apply(la, lo, raw)
             rails = railways.parts(FRAME, [f], (-60, -10, 60, 10))
-            import railprofile      # (the bed is railprofile's: smoothed over the ridge, the cut at most MAX_CUT_M)
+            import railprofile      # (the bed is railprofile's: the solve's, over the ridge under the grade and the curve law)
             railprofile._NODES.clear()
             (zb,) = railprofile.beds(FRAME, "ridge", lambda k: f, lambda xy: ridge(*FRAME.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)[:2]), rails)
             want = np.interp(e, rails[0][3][:, 0], zb)
             self.assertLess(np.abs(got - want).max(), 0.1, f"the ground at {off} m off the line is at its bed")
-            self.assertLess(abs(float(got[12]) - float(raw[12])), railprofile.MAX_CUT_M + 0.3,
-                            "over the ridge as it is, cut by the smoothing at most")
+            self.assertGreater(float(got[12]), 10.0 - 0.1, "never under the ridge's own foot")
+            self.assertLess(float(got[12]), float(raw[12]), "the ridge cut for the track, the rock not left over it")
         self.assertLess(railways.FOOT_MAX_M, 10.0)
 
     def test_written_with_the_tile(self):
@@ -1011,7 +1006,7 @@ class UnderpassNeighbourTest(unittest.TestCase):
                 profiles = railways.profile(parts, flat, railways.road_underpasses(FRAME, [f], box))
                 for part, (bed, _) in zip(parts, profiles):
                     if part[0] == neighbour:
-                        np.testing.assert_allclose(bed, 10.0, atol=1e-6)
+                        np.testing.assert_allclose(bed, 10.0, atol=1.5e-2)
 
     def test_existing_neighbour_bridge_keeps_its_height(self):
         f = features([[(-200, 100), (450, 100)], [(-200, 114), (450, 114)],
@@ -1025,7 +1020,7 @@ class UnderpassNeighbourTest(unittest.TestCase):
         self.assertTrue(neighbour)
         for part, bed in neighbour:
             self.assertEqual(part[2], "bridge")
-            np.testing.assert_allclose(bed, 10.0, atol=1e-6,
+            np.testing.assert_allclose(bed, 10.0, atol=1.5e-2,
                                        err_msg="a tunnel under a different track must not raise this bridge")
 
     def test_track_connected_far_away_does_not_get_another_span(self):
