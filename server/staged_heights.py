@@ -494,7 +494,7 @@ def constraints_of(net, sysm, pcs, smp, gl, fixed_z, at=None, spacing="true"):
     if at is not None:
         base = ia.Constraints(net, sysm, pcs, smp, gl, fixed_z, spacing, problem)
         ground = type("G", (), {"at": staticmethod(lambda m, s: at(m, s)), "fixed": staticmethod(fixed_z)})
-        hs = s4.holds_of(net, sysm, pcs, smp, ground, base.node)
+        hs = s4.holds_of(net, sysm, pcs, smp, ground, base.node, gl)
     return s4.Constraints(net, sysm, pcs, smp, gl, fixed_z, spacing, problem, hs)
 
 

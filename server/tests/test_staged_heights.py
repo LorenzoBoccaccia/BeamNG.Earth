@@ -175,3 +175,27 @@ def test_popolis_tubes_agree_with_the_kernel_curve_bound_and_all():
         worst = max(worst, max(float(np.abs(a - b).max()) for a, b in zip(H.zs, zk)))
         assert H.stats["curve_excess_m"] <= 2e-3
     assert worst < 0.01
+
+
+def test_the_end_of_a_dip_is_held_to_the_ground_the_problem_has_there_not_to_another_reading_of_it():
+    """Compiegne's roundabout was infeasible in staged and not in the kernel: the hold on a dip's last sample read the graded road's
+    height (55.68 m) while the problem's own ceiling there, the ground list, was 54.83 m, so the hold's floor stood 0.85 m over the
+    ceiling. The hold takes the ground list's number, the one its ceiling is."""
+    m = [road(("street", "ground", "street"), line(-400, 0, 400, 0, 100), cls="residential", kmh=40, half=4.0),
+         road(("deck", "deck", 0, 0), line(0, -6, 0, 6, 4), "deck", "tertiary", 1.0, half=4.0),
+         road(("s", "ground", "s"), line(0, -300, 0, -6), cls="tertiary", kmh=50, half=4.0),
+         road(("n", "ground", "n"), line(0, 6, 0, 300), cls="tertiary", kmh=50, half=4.0)]
+    S = placed(m)
+    sysm = S.G.systems[0]
+    pcs = gs.pieces(S.net, sysm)
+    assert any(pc["kind"] == "dip" for pc in pcs)
+    smp = gs.sample(S.net, pcs)
+    gl = [np.asarray(a, np.float64) + 0.85 for a in s4.ground_lists(S.ground, S.net, smp)]
+    other = type("G", (), {"at": staticmethod(lambda mm, s: np.full(np.shape(s), 99.0)), "fixed": staticmethod(S.ground.fixed)})
+    held = [h for h in s4.holds_of(S.net, sysm, pcs, smp, other, lambda p, i: (p, i), gl) if "going under" in h.text]
+    assert held
+    ends = {(p, e) for p, pc in enumerate(pcs) if pc["kind"] == "dip" for e in (0, len(smp[p]["ms"]) - 1)}
+    for h in held:
+        p, e = h.node
+        assert (p, e) in ends
+        assert h.hi == pytest.approx(float(gl[p][e]))
