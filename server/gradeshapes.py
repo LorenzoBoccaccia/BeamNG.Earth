@@ -1499,6 +1499,15 @@ def _onward(net, j, s_from, toward_end):
     return segs + (walk(net, j, False, left) if left > 1e-6 else [])
 
 
+def approach_xy(net, j, s_from, toward_end, length, step):
+    """The points every step m along the road j from arc length s_from on, away from the shape (_onward: through its
+    joints), length m at most (k, 2). Pure."""
+    x = sample(net, [dict(segs=_onward(net, j, s_from, toward_end))])[0]
+    d = np.asarray(x["d"], np.float64)
+    q = np.arange(0.0, min(float(length), float(d[-1])) + 1e-9, float(step))
+    return np.stack([np.interp(q, d, x["xy"][:, 0]), np.interp(q, d, x["xy"][:, 1])], axis=1)
+
+
 def _split(net, x, z, k_end, mode, out):
     """A ramp's or dip's samples (x from sample()) up to k_end, per member: out[member] += (s ascending, z, mode)."""
     mem, ms = x["mem"][:k_end], x["ms"][:k_end]

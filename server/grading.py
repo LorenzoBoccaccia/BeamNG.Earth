@@ -2472,25 +2472,32 @@ def _held_by_decks(xy, move, ends, hold=SEAM_DECK_HOLD_M):
 
 def _deck_segments(decks, pad):
     """Every deck's segments as arrays once, for _under_decks: (a, b, reach: its half width + pad, the first of its
-    deck's, the last of its deck's); decks [(line (k, 2), half width)]."""
+    deck's, the last of its deck's, its deck's first and last points); decks [(line (k, 2), half width)]."""
     decks = [(np.asarray(ln, np.float64)[:, :2], float(h)) for ln, h in decks if len(ln) >= 2]
     if not decks:
-        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0), np.zeros(0, bool), np.zeros(0, bool)
+        return (np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0), np.zeros(0, bool), np.zeros(0, bool),
+                np.zeros((0, 2)), np.zeros((0, 2)))
     return (np.concatenate([ln[:-1] for ln, _h in decks]), np.concatenate([ln[1:] for ln, _h in decks]),
             np.concatenate([np.full(len(ln) - 1, h + pad) for ln, h in decks]),
             np.concatenate([np.arange(len(ln) - 1) == 0 for ln, _h in decks]),
-            np.concatenate([np.arange(len(ln) - 1) == len(ln) - 2 for ln, _h in decks]))
+            np.concatenate([np.arange(len(ln) - 1) == len(ln) - 2 for ln, _h in decks]),
+            np.concatenate([np.repeat(ln[:1], len(ln) - 1, axis=0) for ln, _h in decks]),
+            np.concatenate([np.repeat(ln[-1:], len(ln) - 1, axis=0) for ln, _h in decks]))
 
 
 def _under_decks(xy, segs):
     """bool (n,): the points of xy (n, 2+) under a deck (segs: _deck_segments): within its reach of its line, beside
-    it, not past its ends. Past a deck's end is the ground it ends on, not under it: counted under (the disc of its
-    reach round its end), a motorway branch leaving its node 15 m past the High Five's 15 m wide deck could only go
-    down, 2.8 m under the main road on the abutment's fill it landed on there, and Pregerson's motorway 8 m past a
-    deck's start 2.4 m under its own: neither network had an answer, each left as it was. Pure."""
+    it, not past its ends, and not at them. Past a deck's end is the ground it ends on, not under it: counted under (the
+    disc of its reach round its end), a motorway branch leaving its node 15 m past the High Five's 15 m wide deck could
+    only go down, 2.8 m under the main road on the abutment's fill it landed on there, and Pregerson's motorway 8 m past
+    a deck's start 2.4 m under its own: neither network had an answer, each left as it was. At its end (within
+    gradeshapes.JOIN_M of it, where the shapes' systems have it meet a road: the deck's end is at that road's height)
+    there is no headroom to keep: a street through the node of a Paris bridge's end (48.9052 N 2.2876 E) could only go
+    down from its own plan, 9 mm under the secondary road the deck's end puts at its ground, the road laws' network
+    of 66 chains without an answer. Pure."""
     xy = np.asarray(xy, np.float64)[:, :2]
     out = np.zeros(len(xy), bool)
-    SA, SB, SH, SF, SL = segs
+    SA, SB, SH, SF, SL, EA, EB = segs
     if not len(SA) or not len(xy):
         return out
     lo, hi = xy.min(0), xy.max(0)
@@ -2502,9 +2509,12 @@ def _under_decks(xy, segs):
     ab = b - a
     t = ((xy[:, None] - a[None]) * ab[None]).sum(2) / np.maximum((ab * ab).sum(1), 1e-12)[None]
     past = (SF[sel][None] & (t < 0.0)) | (SL[sel][None] & (t > 1.0))
+    meet = _gsh.JOIN_M
+    at_end = (dnp.hypot(*(xy[:, None] - EA[sel][None]).transpose(2, 0, 1)) <= meet) \
+        | (dnp.hypot(*(xy[:, None] - EB[sel][None]).transpose(2, 0, 1)) <= meet)
     t = np.clip(t, 0.0, 1.0)
     d = dnp.hypot(*(a[None] + ab[None] * t[..., None] - xy[:, None]).transpose(2, 0, 1))
-    out[((d <= h[None]) & ~past).any(1)] = True
+    out[((d <= h[None]) & ~past & ~at_end).any(1)] = True
     return out
 
 
@@ -4671,6 +4681,41 @@ class _Planner:
             raw = smooth_profile(median_profile(raw, _gsh.STEP_M, 12.0), _gsh.STEP_M, 6.0)
         return raw
 
+    def _abutment_ground(self, net, sysm, pcs, smp, ground):
+        """ground (per piece, along it: _ground_line's) with each deck's end on a road on the ground read as that road's
+        approach is (fill_abutment, ABUT_FILL_ON): the embankment's top where the deck's line ends down the slope short
+        of its abutment. The plans' roads leading onto a bridge and the underpasses' decks (_end_filled) read it so; the
+        shape took the elevation at the line's end, so a deck's natural height ran down to it: the Boulevard Peripherique's
+        slab at Porte Maillot (48.8798 N 2.2813 E: the map's bridge ends 11 m short of it, the lidar terrain has the slab
+        out there, 30.7 m where the street is 37.7) came down 7 m to its end with the road after it, and the road under
+        it at its own 37.7 asked 31 to 32 m of cover over a tube it could not give. Changed in place."""
+        if not ABUT_FILL_ON:
+            return
+        f64 = np.float64
+        piece = {pc["main"]: p for p, pc in enumerate(pcs) if pc["kind"] == "deck"}
+        for i, si, j, sj in sysm["ends"]:
+            p = piece.get(i)
+            if p is None or net.m[i].kind != "deck" or min(sj, net.L[j] - sj) > APPROACH_TOUCH_M:
+                continue            # (a road leads onto a bridge by its end: _abut_ends)
+            xy = _gsh.approach_xy(net, j, sj, sj < net.L[j] / 2, ABUT_FAR_M, PROFILE_STEP)
+            if len(xy) < 5:
+                continue
+            la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
+            try:
+                z = np.asarray(self.elev(np.asarray(la, f64), np.asarray(lo, f64)), f64).reshape(-1)
+            except Exception as e:      # (the approach's ground unread: the deck's end as it was)
+                _caught(e)
+                log.debug("grading: approach of %s: %s: %s", np.round(xy[0]), type(e).__name__, e)
+                continue
+            if not np.isfinite(z).all():
+                continue
+            x = smp[p]
+            on = np.flatnonzero(np.asarray(x["mem"]) == i)
+            if not len(on):
+                continue
+            k = int(on[np.argmin(np.abs(np.asarray(x["ms"], f64)[on] - si))])
+            ground[p][k] = max(float(ground[p][k]), float(fill_abutment(z, False)[0]))
+
     def _track_bed(self, xy, fid=None):
         """The railways' bed (n,) at points xy (n, 2) on a track's line (of line fid only, when given), in the DEM's
         heights: railways.track_beds round them, the bed grade_plans lays the ground to and tile_mesh draws the track
@@ -4879,6 +4924,7 @@ class _Planner:
             else:
                 try:
                     ground = [self._ground_line(x["xy"]) for x in smp]
+                    self._abutment_ground(net, sysm, pcs, smp, ground)
                     zs = _gsh.solve_shape(net, sysm, pcs, smp, ground, fixed_z, diag)
                     with _SHAPE_SOLVE_LOCK:
                         if len(cache) >= 4096:
