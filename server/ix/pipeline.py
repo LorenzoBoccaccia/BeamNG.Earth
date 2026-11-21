@@ -14,7 +14,7 @@ import numpy as np
 
 import gradeshapes as _gsh
 
-from . import cache, s1_paths, s2_extent, s3_order, s4_terrain, s5_datum, s6_heights
+from . import artifacts, cache, owner, s1_paths, s2_extent, s3_order, s4_terrain, s5_datum, s6_heights
 
 log = logging.getLogger("earthd.grading")
 
@@ -75,12 +75,12 @@ def system(planner, net, sysm, fixed_z, extent_key, hk, clock):
     xproc.check_cancel()        # (a place a teleport left: not its next system either, a left city's 40 s solves held
     #                              the road tiles)
     t0 = time.perf_counter()
-    pcs, smp, ck = s6_heights.problem(planner, net, sysm)
+    pcs, smp = s6_heights.problem(planner, net, sysm)
     system_id = _gsh.system_key(net, sysm)
     scope = "system:%s" % system_id
     where = "%s system %s" % (hk, system_id)
     inputs = _samples_bytes(net, sysm, smp)
-    ground, zs, diag = s6_heights.solve(planner, net, sysm, pcs, smp, ck, fixed_z)
+    ground, zs, diag = s6_heights.solve(planner, net, sysm, pcs, smp, fixed_z)
     t_solve = time.perf_counter() - t0
     n_x = len(sysm["crossings"])
 
@@ -104,10 +104,50 @@ def system(planner, net, sysm, fixed_z, extent_key, hk, clock):
     return pcs, smp, zs, diag, ground, heights_key
 
 
+def interchange(planner, ik, net, sysm, others, hk, clock):
+    """One whole interchange's steps, the owner's (owner.made): the paths and extent of its net, its system's steps
+    (system()), then its embankments and profiles. ({road feature id: [(xy (m, 2), z (m,), mode)]}, None), or ({}, why)
+    where there is no answer. others: the net's other systems (the shapes' pieces its ramps stop at)."""
+    scope = "interchange:%s" % ik
+    inputs = _members_bytes(net.m)
+    where = "%s interchange %s" % (hk, ik)
+    parents = ()
+    if cache.ROOT:      # (the net's paths are every member's relations, most of them the ground roads': made for the cache
+        #                  and its checks alone, the solve reads none of them; the region's own were made already)
+        t0 = time.perf_counter()
+        paths, paths_key = _put(s1_paths.run(planner, net, scope), (), inputs)
+        _line(clock, "paths", paths_key, len(paths.members), len(paths.crossings), time.perf_counter() - t0, None,
+              where)
+        parents = (paths_key,)
+    t0 = time.perf_counter()
+    extent = artifacts.Extent(artifacts.Meta(s2_extent.STEP, s2_extent.FORMAT, "", (), s2_extent.LAWS_DIGEST, scope),
+                              ik, [s2_extent.system_of(net, sysm)])
+    _extent, extent_key = _put(extent, parents, inputs)
+    _line(clock, "extent", extent_key, 1, len(sysm["crossings"]), time.perf_counter() - t0, None, where)
+    fixed_z = s2_extent.make_fixed(planner, net)
+    pcs, smp, zs, diag, ground, heights_key = system(planner, net, sysm, fixed_z, extent_key, where, clock)
+    if zs is None:              # (no answer: the system as it is, and why in the log; no stand-in)
+        why = _heights_why(zs, diag)
+        log.error("grading: SHAPES infeasible system in region %s: %d pieces, %d crossings, %d ends; %s; members %s",
+                  hk, len(pcs), len(sysm["crossings"]), len(sysm["ends"]),
+                  diag.get("qp_error") or ", ".join("%s %s" % (k, diag[k]) for k in sorted(diag)
+                                                    if k not in ("converged", "feasible")),
+                  ", ".join(sorted({str(net.m[i].key[0])[:8] + ":" + net.m[i].kind for i in sysm["seeds"]}))[:600])
+        return {}, why
+    if os.environ.get("BNE_SHAPES_DEBUG"):
+        planner._shape_debug(net, sysm, pcs, smp, zs, ground, fixed_z, diag)
+    prof, region = s6_heights.region_of(planner, net, [sysm], [(pcs, smp, zs)], ik,
+                                        [_gsh.pieces(net, o) for o in others])
+    _put(region, (extent_key, heights_key), inputs + [heights_key.encode()])
+    return prof, None
+
+
 def region(planner, home, hk):
-    """What _shape_region_calc(home, hk) returned: {road feature id: [(xy (m, 2), z (m,), mode)]}, built by the s1..s6
-    steps (the artifacts written, never read back)."""
-    import grading      # (the planner's module: its laws and its solve lock; imported here, grading imports us first)
+    """What _shape_region_calc(home, hk) returns: {road feature id: [(xy (m, 2), z (m,), mode)]}, built by the s1..s6
+    steps (the artifacts written, never read back). The systems the region's box holds are pieces of interchanges (the
+    box cuts them anywhere): each is asked for as the interchange it is (owner.interchange), solved once for every region
+    and process that reaches it, and its heights taken whole."""
+    import grading      # (the planner's module: its laws; imported here, grading imports us first)
     t0 = time.perf_counter()
     clock = {}
     lon0, lat0, lon1, lat1 = (float(v) for v in home.bounds())
@@ -116,11 +156,10 @@ def region(planner, home, hk):
     h_lo = np.array([np.min(ce), np.min(cn)]) - grading.SHAPES_PAD_M
     h_hi = np.array([np.max(ce), np.max(cn)]) + grading.SHAPES_PAD_M
     box_lo, box_hi = h_lo - 200.0, h_hi + 200.0
-    cap_lo, cap_hi = h_lo - grading.SHAPES_CAP_M, h_hi + grading.SHAPES_CAP_M
 
-    # (steps 1 and 2 run once for the region: its members are read and its systems found together, the loop's time is
-    # split in clock as "paths" (the cells' members and one_road) and "extent" (find_systems))
-    extent, net, mine, loaded, members = s2_extent.run(planner, hk, h_lo, h_hi, box_lo, box_hi, cap_lo, cap_hi, clock)
+    # (steps 1 and 2 run once for the region: its members are read and its systems found together, the time is split in
+    # clock as "paths" (the cells' members and one_road) and "extent" (find_systems))
+    extent, net, mine, loaded, members = s2_extent.run(planner, hk, h_lo, h_hi, box_lo, box_hi, clock)
     region_scope = "region:%s" % hk
     inputs = _members_bytes(members)
     t_paths = time.perf_counter()
@@ -133,30 +172,25 @@ def region(planner, home, hk):
           clock.pop("extent", 0.0) + time.perf_counter() - t_extent, None, hk)
     t1 = time.perf_counter()
 
-    fixed_z = s2_extent.make_fixed(planner, net)
-
-    shapes, failed, solved, keys = [], 0, [], []
+    found = {}
     for sysm in mine:
-        pcs, smp, zs, diag, ground, heights_key = system(planner, net, sysm, fixed_z, extent_key, hk, clock)
-        if zs is None:          # (no answer: the system as it is, and why in the log; no stand-in)
-            failed += 1
-            log.error("grading: SHAPES infeasible system in region %s: %d pieces, %d crossings, %d ends; %s; "
-                      "members %s", home, len(pcs), len(sysm["crossings"]), len(sysm["ends"]),
-                      diag.get("qp_error") or ", ".join("%s %s" % (k, diag[k]) for k in sorted(diag)
-                                                        if k not in ("converged", "feasible")),
-                      ", ".join(sorted({str(net.m[i].key[0])[:8] + ":" + net.m[i].kind for i in sysm["seeds"]}))[:600])
-            continue
-        solved.append(sysm)
-        shapes.append((pcs, smp, zs))
-        keys.append(heights_key)
-        if os.environ.get("BNE_SHAPES_DEBUG"):
-            planner._shape_debug(net, sysm, pcs, smp, zs, ground, fixed_z, diag)
-
-    prof, region = s6_heights.region_of(planner, net, solved, shapes, hk)
-    _put(region, (extent_key,) + tuple(keys), _members_bytes(members) + [k.encode() for k in keys])
-    log.warning("grading: SHAPES pid %d region %s: %d cells, %d members, %d systems (%d infeasible, left as they are), "
-                "%d roads graded, find %.2f s, solve %.2f s", os.getpid(), hk, len(loaded), len(members), len(mine),
-                failed, len(prof), t1 - t0, time.perf_counter() - t1)
-    log.info("ix region: %s systems %d %.2f s, steps %s", hk, len(mine), time.perf_counter() - t0,
-             ", ".join("%s %.2f s" % (k, clock.get(k, 0.0)) for k in STEPS))
+        xproc_cancel()
+        got = owner.interchange(planner, net, sysm, home, hk, clock)
+        found[got["key"]] = got
+    t_owner = time.perf_counter() - t1
+    prof = {}
+    for ik in sorted(found):
+        for fid, items in found[ik]["roads"].items():
+            prof.setdefault(fid, []).extend(items)
+    failed = sum(1 for g in found.values() if g["failed"])
+    log.warning("grading: SHAPES pid %d region %s: %d cells, %d members, %d systems (%d interchanges, %d infeasible, "
+                "left as they are), %d roads graded, find %.2f s, solve %.2f s", os.getpid(), hk, len(loaded),
+                len(members), len(mine), len(found), failed, len(prof), t1 - t0, t_owner)
+    log.info("ix region: %s systems %d %.2f s, steps %s, interchanges %.2f s", hk, len(mine), time.perf_counter() - t0,
+             ", ".join("%s %.2f s" % (k, clock.get(k, 0.0)) for k in STEPS), t_owner)
     return prof
+
+
+def xproc_cancel():
+    import xproc
+    xproc.check_cancel()        # (a place a teleport left: not its next interchange either)
