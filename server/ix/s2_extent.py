@@ -56,37 +56,27 @@ def system_of(net, sysm):
                             tuple(float(v) for v in np.r_[pts.min(0), pts.max(0)]))
 
 
-def run(planner, hk, h_lo, h_hi, box_lo, box_hi, cap_lo, cap_hi, clock=None):
-    """find_systems and the region growth loop, as _shape_region_calc ran them: (Extent, net, mine, loaded, members).
-    mine is the systems this region solves (those reaching its home box), in solve order. clock (a dict): the seconds
-    of the members' reading (step 1) and of find_systems (step 2) are added to its "paths" and "extent"."""
+def run(planner, hk, h_lo, h_hi, box_lo, box_hi, clock=None):
+    """The region's own find: find_systems over the members in its box, (Extent, net, mine, loaded, members). mine is the
+    systems reaching its home box, in solve order: each only the piece of its interchange the box has (the box cuts the
+    interchange anywhere), which owner.grow follows to the whole one. clock (a dict): the seconds of the members' reading
+    (step 1) and of find_systems (step 2) are added to its "paths" and "extent"."""
     import xproc
     clock = {} if clock is None else clock
     byk, loaded = {}, set()
-    while True:
-        xproc.check_cancel()        # (a place a teleport left: its systems not found and solved for it)
-        t0 = time.perf_counter()
-        s1_paths.load(planner, box_lo, box_hi, byk, loaded)
-        members = s1_paths.members_of(byk, box_lo, box_hi)
-        t1 = time.perf_counter()
-        net, systems = _gsh.find_systems(members, lambda net_: (planner._ground_line, make_fixed(planner, net_)))
-        clock["paths"] = clock.get("paths", 0.0) + t1 - t0
-        clock["extent"] = clock.get("extent", 0.0) + time.perf_counter() - t1
-        mine = []
-        n_lo, n_hi = box_lo.copy(), box_hi.copy()
-        for sysm in systems:
-            pts = np.concatenate([net.lines[i] for i in sysm["seeds"]])
-            b_lo, b_hi = pts.min(0), pts.max(0)
-            if (b_hi < h_lo).any() or (b_lo > h_hi).any():
-                continue
+    xproc.check_cancel()        # (a place a teleport left: its systems not found and solved for it)
+    t0 = time.perf_counter()
+    s1_paths.load(planner, box_lo, box_hi, byk, loaded)
+    members = s1_paths.members_of(byk, box_lo, box_hi)
+    t1 = time.perf_counter()
+    net, systems = _gsh.find_systems(members, lambda net_: (planner._ground_line, make_fixed(planner, net_)))
+    clock["paths"] = clock.get("paths", 0.0) + t1 - t0
+    clock["extent"] = clock.get("extent", 0.0) + time.perf_counter() - t1
+    mine = []
+    for sysm in systems:
+        pts = np.concatenate([net.lines[i] for i in sysm["seeds"]])
+        if not ((pts.max(0) < h_lo).any() or (pts.min(0) > h_hi).any()):
             mine.append(sysm)
-            if (b_lo < box_lo + 100.0).any() or (b_hi > box_hi - 100.0).any():     # (open: follow it)
-                n_lo = np.minimum(n_lo, b_lo - 300.0)
-                n_hi = np.maximum(n_hi, b_hi + 300.0)
-        n_lo, n_hi = np.maximum(n_lo, cap_lo), np.minimum(n_hi, cap_hi)
-        if (n_lo >= box_lo).all() and (n_hi <= box_hi).all():
-            break
-        box_lo, box_hi = n_lo, n_hi
     extent = artifacts.Extent(artifacts.Meta(STEP, FORMAT, "", (), LAWS_DIGEST, "region:%s" % hk), str(hk),
                               [system_of(net, sysm) for sysm in mine])
     return extent, net, mine, loaded, members
