@@ -1,5 +1,6 @@
 """Ground graded under roads (grading.py): the profile smoothing, flat across the core, untouched away from
 roads, junctions blended, the plans made once per cell, and GradedDem as a drop-in DEM."""
+import contextlib
 import math
 import os
 import sys
@@ -334,6 +335,34 @@ class GradePointsTest(unittest.TestCase):
         y, z = self.trench_case(True, 90.0, along=True)
         np.testing.assert_array_equal(z, self.trench_case(False, 90.0, along=True)[1])
         self.assertTrue(np.allclose(z[np.abs(y) <= 6.0 - 0.01], 4.3, atol=0.02), "(over the trench: its floor)")
+
+    def test_a_tunnel_in_the_open_is_a_trench_unless_a_ground_road_crosses_it(self):
+        # The junction eval's Barcelona trench: a trunk under street bridges, read open all along once the planner's
+        # deck-ground correction took the bridges out of its cover; nothing on the ground crosses it. Flagged for the
+        # open ease alone, the primary along its rim was eased 1.8 m down toward the floor. A road mapped on the ground
+        # across the open part is the deck over an underpass (it eases onto the held carriageway); a part covered
+        # elsewhere is a trench either way.
+        spec = roads.Spec(12.0, "paved", True, "trunk")
+        along = np.array([[-200.0, 0.0], [200.0, 0.0]])
+        crossing = grading.Plan(np.array([[0.0, -50.0], [0.0, 50.0]]), np.array([9.0, 9.0]), 5.0)
+        crossing.rank = grading.grade_rank(spec)
+        beside = grading.Plan(np.array([[-100.0, 20.0], [100.0, 20.0]]), np.array([9.0, 9.0]), 5.0)
+        beside.rank = grading.grade_rank(spec)
+        cases = (("no road over it", (0,), [("beside.0", beside)], False),
+                 ("a ground road crossing it", (0,), [("beside.0", beside), ("cross.0", crossing)], True),
+                 ("covered elsewhere on the part", (0, 2), [("cross.0", crossing)], False))
+        for what, kinds, roads_, open_tunnel in cases:
+            secs = [("road.0#%d" % n, spec, along + [0.0, 100.0 * n], np.array([4.3, 4.3]), k) for n, k in enumerate(kinds)]
+            planner = grading._Planner(FRAME, None, None)
+            with contextlib.ExitStack() as patches:
+                for name, got in (("_road_stage", (np.zeros(1), roads_, [])), ("_tunnel_sections", secs),
+                                  ("_mouth_plans", [])):
+                    patches.enter_context(unittest.mock.patch.object(planner, name, return_value=got))
+                patches.enter_context(unittest.mock.patch.object(grading, "_twin_trimmed", return_value=secs))
+                plans = planner._make_cell("cell")[0]
+            tunnel = [p for fid, p in plans if fid.endswith(grading.TUNNEL_TAG)]
+            self.assertEqual(len(tunnel), 1, what)
+            self.assertEqual((tunnel[0].open_tunnel, tunnel[0].tunnel_section), (open_tunnel, not open_tunnel), what)
 
     def test_a_deeper_dirt_road_still_leaves_the_paved_carriageway_whole(self):
         # A dirt path 1.8 m under the asphalt's level beside it (the height rule's fade starts at 1.5 m): the paved

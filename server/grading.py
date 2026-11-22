@@ -2493,6 +2493,30 @@ def shoulder(spec):
     return SHOULDER_M
 
 
+def _road_of(fid):
+    """The road (feature id) a plan's or section's id belongs to: without its part, its sub-road and its lane section."""
+    return str(fid).rsplit("#", 1)[0].rsplit(".", 1)[0].partition("~lanes")[0]
+
+
+def _ground_road_crosses(xy, road, plans):
+    """Does a ground road of plans ([(fid, Plan)]) cross the line xy (a tunnel section's), a road other than road (the
+    section's own)? A road ending on the line, or only touching it, is no crossing. Pure."""
+    xy = np.asarray(xy, np.float64)[:, :2]
+    if len(xy) < 2:
+        return False
+    lo, hi = xy.min(axis=0), xy.max(axis=0)
+    for fid, p in plans:
+        if p.rank < 0 or str(fid).startswith(RAIL_TAG) or TUNNEL_TAG in str(fid) or FLANK_TAG in str(fid) \
+                or _road_of(fid) == road:
+            continue
+        pxy = np.asarray(p.xy, np.float64)[:, :2]
+        if len(pxy) < 2 or (pxy.max(axis=0) < lo).any() or (pxy.min(axis=0) > hi).any():
+            continue
+        if any(0.0 < ta < 1.0 and 0.0 < tb < 1.0 for _i, _j, ta, tb, _q in _gsh._seg_hits(xy, pxy)):
+            return True
+    return False
+
+
 def _twin_trimmed(secs):
     """secs ([(fid, spec, xy, z, kind)]) with the covered sections of twin tunnels (roads.twin_tunnels: side by side,
     one tube round both) cut to the stretch they share: one twin's portal a few metres deeper than the other's, the
@@ -2973,12 +2997,16 @@ class _Planner:
                 if k == 0:
                     p = Plan(xy, z, spec.width / 2 + shoulder(spec))
                     p.rank = grade_rank(spec)
-                    # (a tunnel part open all along, no cover anywhere over it: the map's underpass under a deck or lid
-                    # the elevation leaves out. A road crossing it is that deck, mapped on the ground over the tunnel:
-                    # it eases onto the held carriageway whatever its class, gradebins OPEN_TUNNEL (Kennedybruecke in
-                    # Vienna: a bus lane stepped 1.2 m down to it, GitHub #1169). An open stretch by a portal is a real
-                    # trench, the roads beside it on the cover: they keep their ground)
-                    p.open_tunnel = OPEN_TUNNEL_EASE and fid.rsplit("#", 1)[0] not in covered
+                    # (a tunnel part open all along, no cover anywhere over it, with a road crossing it: the map's
+                    # underpass under a deck or lid the elevation leaves out. A road crossing it is that deck, mapped on
+                    # the ground over the tunnel: it eases onto the held carriageway whatever its class, gradebins
+                    # OPEN_TUNNEL (Kennedybruecke in Vienna: a bus lane stepped 1.2 m down to it, GitHub #1169). An open
+                    # stretch by a portal is a real trench, the roads beside it on the cover: they keep their ground. So
+                    # is one nothing is mapped over on the ground, its crossing streets bridges: a trunk under street
+                    # bridges is open all along once the planner's deck-ground correction has taken the bridges out of
+                    # its cover, and the open ease took the primary along its rim 1.8 m down to the floor)
+                    p.open_tunnel = OPEN_TUNNEL_EASE and fid.rsplit("#", 1)[0] not in covered and _ground_road_crosses(
+                        xy, _road_of(fid), plans)
                     # (and that trench, the tunnel covered elsewhere: the streets along its top keep their ground past
                     # its painted edge whatever the rank gap, gradebins TUNNEL. Within it a primary beside a trunk took
                     # the side ease down toward the floor 5 m under it: its lanes tilted 1-3.5 m toward the trench, the
