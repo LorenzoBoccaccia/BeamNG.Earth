@@ -2463,6 +2463,44 @@ def _held_by_decks(xy, move, ends, hold=SEAM_DECK_HOLD_M):
     return np.clip(move, -cap, cap)
 
 
+def _deck_segments(decks, pad):
+    """Every deck's segments as arrays once, for _under_decks: (a, b, reach: its half width + pad, the first of its
+    deck's, the last of its deck's); decks [(line (k, 2), half width)]."""
+    decks = [(np.asarray(ln, np.float64)[:, :2], float(h)) for ln, h in decks if len(ln) >= 2]
+    if not decks:
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0), np.zeros(0, bool), np.zeros(0, bool)
+    return (np.concatenate([ln[:-1] for ln, _h in decks]), np.concatenate([ln[1:] for ln, _h in decks]),
+            np.concatenate([np.full(len(ln) - 1, h + pad) for ln, h in decks]),
+            np.concatenate([np.arange(len(ln) - 1) == 0 for ln, _h in decks]),
+            np.concatenate([np.arange(len(ln) - 1) == len(ln) - 2 for ln, _h in decks]))
+
+
+def _under_decks(xy, segs):
+    """bool (n,): the points of xy (n, 2+) under a deck (segs: _deck_segments): within its reach of its line, beside
+    it, not past its ends. Past a deck's end is the ground it ends on, not under it: counted under (the disc of its
+    reach round its end), a motorway branch leaving its node 15 m past the High Five's 15 m wide deck could only go
+    down, 2.8 m under the main road on the abutment's fill it landed on there, and Pregerson's motorway 8 m past a
+    deck's start 2.4 m under its own: neither network had an answer, each left as it was. Pure."""
+    xy = np.asarray(xy, np.float64)[:, :2]
+    out = np.zeros(len(xy), bool)
+    SA, SB, SH, SF, SL = segs
+    if not len(SA) or not len(xy):
+        return out
+    lo, hi = xy.min(0), xy.max(0)
+    blo, bhi = np.minimum(SA, SB) - SH[:, None], np.maximum(SA, SB) + SH[:, None]
+    sel = np.flatnonzero((bhi[:, 0] >= lo[0]) & (bhi[:, 1] >= lo[1]) & (blo[:, 0] <= hi[0]) & (blo[:, 1] <= hi[1]))
+    if not len(sel):
+        return out
+    a, b, h = SA[sel], SB[sel], SH[sel]
+    ab = b - a
+    t = ((xy[:, None] - a[None]) * ab[None]).sum(2) / np.maximum((ab * ab).sum(1), 1e-12)[None]
+    past = (SF[sel][None] & (t < 0.0)) | (SL[sel][None] & (t > 1.0))
+    t = np.clip(t, 0.0, 1.0)
+    d = dnp.hypot(*(a[None] + ab[None] * t[..., None] - xy[:, None]).transpose(2, 0, 1))
+    out[((d <= h[None]) & ~past).any(1)] = True
+    return out
+
+
 def shape_heights(z, zs, modes):
     """(heights, set) of a plan's points z under the shapes' heights there (zs, modes: _Planner._shape_at's): a "fill"
     raises a point to its embankment, a "cut" lowers it into its cut, a "set" puts it there; set: the points whose
@@ -4960,27 +4998,10 @@ class _Planner:
             return (lo if lo is not None else np.full(n_, -np.inf)), (hi if hi is not None else np.full(n_, np.inf))
 
         # (every deck's segments as arrays once: a plan's points against those whose box meets the plan's, at once)
-        SA = np.concatenate([ln[:-1] for ln, _h in decks]) if decks else np.zeros((0, 2))
-        SB = np.concatenate([ln[1:] for ln, _h in decks]) if decks else np.zeros((0, 2))
-        SH = np.concatenate([np.full(len(ln) - 1, h + ROAD_LAWS_DECK_M) for ln, h in decks]) if decks else np.zeros(0)
-        SLO = np.minimum(SA, SB) - SH[:, None]
-        SHI = np.maximum(SA, SB) + SH[:, None]
+        segs = _deck_segments(decks, ROAD_LAWS_DECK_M)
 
         def under(i):
-            xy = np.asarray(plans[i][1].xy, np.float64)[:, :2]
-            out = np.zeros(len(xy), bool)
-            if not len(SA) or not len(xy):
-                return out
-            lo, hi = xy.min(0), xy.max(0)
-            sel = np.flatnonzero((SHI[:, 0] >= lo[0]) & (SHI[:, 1] >= lo[1]) & (SLO[:, 0] <= hi[0]) & (SLO[:, 1] <= hi[1]))
-            if not len(sel):
-                return out
-            a, b, h = SA[sel], SB[sel], SH[sel]
-            ab = b - a
-            t = np.clip(((xy[:, None] - a[None]) * ab[None]).sum(2) / np.maximum((ab * ab).sum(1), 1e-12)[None], 0, 1)
-            d = np.hypot(*(a[None] + ab[None] * t[..., None] - xy[:, None]).transpose(2, 0, 1))
-            out[(d <= h[None]).any(1)] = True
-            return out
+            return _under_decks(plans[i][1].xy, segs)
         skip = [i for i, (f, _p) in enumerate(plans) if TUNNEL_TAG in str(f)] + list(keep)
         info = {}
         dbg = os.environ.get("BNE_LAWS_DEBUG")         # "lat,lon": the plans within 40 m of it, before and after
@@ -5003,9 +5024,12 @@ class _Planner:
             a, b = nodes.get(str(plans[i][0]).split(":")[0]), nodes.get(str(plans[j][0]).split(":")[0])
             return None if a is None or b is None else bool(a & b)
         n = roadlaws.apply([p for _f, p in plans], specs, held, under, skip, info, natural, meets, bounds)
-        # (a side road the laws landed on the road it joins, at its height and its grade its way, keeps its own plan at
-        # the mouth: as high a grade rank, its ground no longer eased flat onto that road's for RANK_SIDE_FADE_M past its
-        # carriageway, the sag a 12 m truck bottomed out in at the mouth)
+        # (a side road that stands landed on the road it joins, at its height and its grade its way (roadlaws: measured
+        # on the plans as they end up, whether the laws put it there or it stood there), keeps its own plan at the
+        # mouth: as high a grade rank, its ground no longer eased flat onto that road's for RANK_SIDE_FADE_M past its
+        # carriageway, the sag a 12 m truck bottomed out in at the mouth. One that does not meet the road keeps the
+        # ease that hides the difference: a road the passes held whole, 0.3 m under the primary's edge 4 m from its
+        # mouth, was promoted all the same and its ledge stood bare, two 0.33 / 0.39 m steps at Riva del Garda)
         for i, j in info.get("landed", ()) if info.get("feasible", True) else ():
             pi, pj = plans[i][1], plans[j][1]
             if getattr(pj, "rank", -1) > getattr(pi, "rank", -1) >= 0:
@@ -5784,7 +5808,19 @@ class _Planner:
                 touch[js] = False
                 continue
             d = dnp.hypot(pe[js, None, 0] - ends[None, :, 0], pe[js, None, 1] - ends[None, :, 1])
-            touch[js] = (d <= APPROACH_TOUCH_M).any(axis=1)
+            near = d <= APPROACH_TOUCH_M
+            # (a road end near a bridge's end is no abutment when a ground part going on from it reaches that end: the
+            # end is the junction behind a stub, the abutment is the stub's far end. Riva del Garda, Via Gardesana: a way
+            # with 1.03 m of ground between its junction and its bridge: the junction's three roads and the stub's
+            # start all stood within 2.5 m of the bridge's end and all were flagged; held at their own heights, the stub
+            # took the hillside's raw 28 % fall in its metre, 0.86 m under the approach at the same node)
+            behind = np.zeros_like(near)
+            for a, j in enumerate(js.tolist()):
+                mates = np.flatnonzero(dnp.hypot(pe[:, 0] - pe[j, 0], pe[:, 1] - pe[j, 1]) <= CHAIN_JOIN_M)
+                for far in {int(j) ^ 1} | {int(k) ^ 1 for k in mates if k != j}:    # (the ends are start, end per part)
+                    if far < len(pe):
+                        behind[a] |= dnp.hypot(pe[far, 0] - ends[:, 0], pe[far, 1] - ends[:, 1]) <= CHAIN_JOIN_M
+            touch[js] = (near & ((d <= CHAIN_JOIN_M) | ~behind)).any(axis=1)
         return touch
 
     def _end_raised(self, xy):
