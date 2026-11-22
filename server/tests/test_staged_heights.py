@@ -46,7 +46,7 @@ def test_the_sparse_ldl_solves_the_dense_system_and_again_after_new_values():
     for i in range(n):
         M[i, i] = rng.uniform(6.0, 9.0)
         for j in (i + 1, i + 2, (i * 7 + 3) % n):         # (bands, and a few entries off them: the rows between pieces)
-            if j > i:
+            if i < j < n:
                 M[i, j] = M[j, i] = rng.uniform(-1.0, 1.0)
     up = np.triu(M)
     ptr = np.r_[0, np.cumsum([int(np.count_nonzero(up[:, j])) for j in range(n)])]
@@ -66,33 +66,51 @@ def test_the_sparse_ldl_solves_the_dense_system_and_again_after_new_values():
         f.refactor(-val)
 
 
-def test_the_sweeps_matrix_is_h_plus_sigma_plus_a_rho_a_transposed():
+def test_the_strongly_connected_pieces_of_a_graph():
+    comp, n = h5._classes(6, np.array([0, 1, 2, 2, 3, 4]), np.array([1, 2, 0, 3, 4, 3]))
+    assert n == 3 and comp[0] == comp[1] == comp[2] and comp[3] == comp[4] and len({comp[0], comp[3], comp[5]}) == 3
+
+
+def _reduced(cons):
+    import interchange_audit as ia
+    dist, cyc = ia._spfa(cons.g)
+    assert cyc is None
+    z0 = np.array([dist[v] - dist[cons.g.zero] for v in range(cons.g.n - 1)])
+    P = h5.Problem(cons)
+    return P, z0, h5.Reduced(P, z0)
+
+
+def test_the_interior_points_matrix_is_h_plus_g_transposed_d_g():
     S = placed(overpass())
     sysm = S.G.systems[0]
     pcs = gs.pieces(S.net, sysm)
     smp = gs.sample(S.net, pcs)
     gl = s4.ground_lists(S.ground, S.net, smp)
     cons = h5.constraints_of(S.net, sysm, pcs, smp, gl, S.ground.fixed, S.ground.at)
-    P = h5.Problem(cons)
-    bn = np.flatnonzero(np.isfinite(P.lo) | np.isfinite(P.hi))
-    c0, c1, c2 = P.CA, -(P.CA + P.CC), P.CC
-    kkt = h5.Kkt(P, bn, c0, c1, c2)
-    m1, m2, m3 = len(P.A), len(bn), len(P.K0)
-    N = P.N
-    rv = np.random.default_rng(2).uniform(0.5, 20.0, m1 + m2 + m3)
-    A = np.zeros((m1 + m2 + m3, N))
-    A[np.arange(m1), P.B] += 1.0
-    A[np.arange(m1), P.A] -= 1.0
-    A[m1 + np.arange(m2), bn] = 1.0
-    for k in range(m3):
-        A[m1 + m2 + k, P.K0[k]] = c0[k]
-        A[m1 + m2 + k, P.K0[k] + 1] = c1[k]
-        A[m1 + m2 + k, P.K0[k] + 2] = c2[k]
-    H = np.diag(P.hd) + np.diag(P.he[:-1], 1) + np.diag(P.he[:-1], -1) + np.diag(P.hf[:-2], 2) + np.diag(P.hf[:-2], -2)
-    K = H + h5.SIGMA * np.eye(N) + A.T @ (rv[:, None] * A)
-    kkt.factor(rv)
-    b = np.random.default_rng(3).normal(size=N)
-    assert np.abs(K @ kkt.solve(b) - b).max() < 1e-8 * max(1.0, np.abs(K).max())
+    P, z0, R = _reduced(cons)
+    K = h5.Normal(R)
+    n = R.n
+    H = np.array([R.Hmul(e) for e in np.eye(n)]).T
+    G = np.array([R.Gmul(e) for e in np.eye(n)]).T
+    assert np.abs(H - H.T).max() < 1e-12 and np.abs(G.T @ np.ones(R.m) - R.Gt(np.ones(R.m))).max() < 1e-9
+    d = np.random.default_rng(2).uniform(0.5, 20.0, R.m)
+    M = H + G.T @ (d[:, None] * G)
+    K.factor(d)
+    b = np.random.default_rng(3).normal(size=n)
+    assert np.abs(M @ K.solve(b) - b).max() < 1e-8 * max(1.0, np.abs(M).max())
+
+
+def test_the_reduction_keeps_every_height_the_constraints_allow():
+    """x = xbase + T y at y0 is the potentials."""
+    S = placed(overpass())
+    sysm = S.G.systems[0]
+    pcs = gs.pieces(S.net, sysm)
+    smp = gs.sample(S.net, pcs)
+    gl = s4.ground_lists(S.ground, S.net, smp)
+    cons = h5.constraints_of(S.net, sysm, pcs, smp, gl, S.ground.fixed, S.ground.at)
+    P, z0, R = _reduced(cons)
+    assert np.abs(R.full(R.y0, P.N) - z0).max() < 1e-9
+    assert R.n <= P.N and R.m > 0
 
 
 def test_an_overpass_gets_heights_that_hold_every_law_and_match_the_kernels():
@@ -100,7 +118,7 @@ def test_an_overpass_gets_heights_that_hold_every_law_and_match_the_kernels():
     sysm = S.G.systems[0]
     H = h5.solve_system(S.net, sysm, S.ground)
     st = H.stats
-    assert st["feasible"] and st["converged"] and st["iterations"] < 1500
+    assert st["feasible"] and st["converged"] and st["iterations"] < 60
     assert st["violation_m"] <= h5.VIOLATION_M and st["grade_excess"] <= 1e-3 and st["clearance_shortfall_m"] <= 1e-3
     pcs = gs.pieces(S.net, sysm)
     smp = gs.sample(S.net, pcs)

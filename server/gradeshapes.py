@@ -1154,7 +1154,7 @@ def solve_shape(net, sysm, pcs, smp, ground, fixed_z, diagnostics=None):
     length s (None: not known), or at an array of them (an array, NaN: not known).
 
     BNE_STAGED=1 (measurement only, nothing is built from it unless asked): the heights come from the staged solver's stage 5
-    (staged_heights: the same problem, our own deterministic ADMM, no kernel), the answer in the same form."""
+    (staged_heights: the same problem, our own deterministic interior-point method, no kernel), the answer in the same form."""
     if os.environ.get("BNE_STAGED", "").strip().lower() in ("1", "on", "yes", "true"):
         import staged_heights
         return staged_heights.solve_shape(net, sysm, pcs, smp, ground, fixed_z, diagnostics)

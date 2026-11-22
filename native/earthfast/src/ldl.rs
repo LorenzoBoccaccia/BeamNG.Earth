@@ -1,5 +1,5 @@
-//! A sparse LDL' of a symmetric positive definite matrix on a fill-reducing ordering (AMD), for the staged grade solver's ADMM
-//! (server/staged_heights.py, stage 5): the matrix (H + sigma I + A' diag(rho) A) of every sweep is factored once for a rho and
+//! A sparse LDL' of a symmetric positive definite matrix on a fill-reducing ordering (AMD), for the staged grade solver's interior-point method
+//! (server/staged_heights.py, stage 5): the matrix (H + G' diag(d) G) of every step is factored on the ordering the first one made and
 //! solved exactly by two triangular sweeps, the way OSQP's direct solver does it. QDLDL (Stellato et al. 2020, Apache-2.0) and
 //! AMD are the ones Clarabel already carries for the shapes' kernel (clarabel::qdldl), pure Rust, the same bits on every platform
 //! (no threads, no floating-point reordering): this file only hands them to Python.
@@ -54,6 +54,9 @@ impl SparseLdl {
         let f = py
             .detach(move || QDLDLFactorisation::new(&a, Some(settings)))
             .map_err(|e| PyValueError::new_err(format!("SparseLdl: {e}")))?;
+        if f.positive_inertia() != n {
+            return Err(PyValueError::new_err("SparseLdl: the matrix is not positive definite"));
+        }
         Ok(SparseLdl { f: Mutex::new(f), n, nnz })
     }
 
@@ -65,10 +68,15 @@ impl SparseLdl {
         }
         let idx: Vec<usize> = (0..self.nnz).collect();
         let f = &self.f;
+        let n = self.n;
         py.detach(|| {
             let mut g = f.lock().unwrap();
             g.update_values(&idx, &v);
-            g.refactor()
+            g.refactor().map_err(|e| e.to_string())?;
+            if g.positive_inertia() != n {
+                return Err("the matrix is not positive definite".to_string());
+            }
+            Ok(())
         })
         .map_err(|e| PyValueError::new_err(format!("SparseLdl.refactor: {e}")))
     }

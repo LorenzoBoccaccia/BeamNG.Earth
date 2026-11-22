@@ -80,7 +80,7 @@ def island_ring_rays(poly, lines_hw, c, rays, step, rmax):
 def sparse_ldl(n, indptr, indices, data):
     """earthfast.SparseLdl: the exact solver of a symmetric positive definite matrix (n x n, its upper triangle as CSC: indptr,
     sorted row indices, data), factored on an AMD ordering; .refactor(data) puts new values on the same structure, .solve(b) gives
-    x of A x = b (staged_heights: ADMM's linear system)."""
+    x of A x = b (staged_heights: the interior-point steps' linear system)."""
     require(310, "SparseLdl")
     return _ef.SparseLdl(int(n), np.ascontiguousarray(indptr, np.int64), np.ascontiguousarray(indices, np.int64),
                          np.ascontiguousarray(data, np.float64))

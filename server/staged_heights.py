@@ -16,43 +16,37 @@ The problem is the shapes' (carriageways.solve), the same one:
 The curve rows are not difference constraints, which is what makes stage 4 exact: stage 4 says whether the grade law, the clearances
 and the joints can all hold, not whether the curves can too (a system that has heights for them and none for the curve is reported
 by stage 5 as not converged, with the curve rows' violation in stats["violation_by_kind"]). They are three entries wide and inside the
-matrix's band, so the ADMM below carries them at no cost in factoring. W_MIN (the kernel's own floor on every weight,
+matrix's band, so they cost the factorisation no fill. W_MIN (the kernel's own floor on every weight,
 native/earthfast carriageway_solver.rs) makes the objective strictly convex and is part of the shapes' answer, not a regulariser of
 ours: a deck's middle weighs nothing and its line is kept by lam alone, so what sets its height is this floor's pull of every sample
 to its natural line (a deck joined at both ends, no target). At Brunau a weight of 1e-4 here instead (what this solver first took) put
 decks 8-10 m over the kernel's and the survey's. Measured against the kernel: Popoli's five systems agree to 4 mm and in objective to
 1e-4, curve excess included; the kernel's answer breaks none of our rows (the same problem), ours none of its.
 
-The method: ADMM in OSQP's form (Stellato et al. 2020), l <= A x <= u the rows above, the objective 1/2 x'Hx - h'x:
+The method: the primal-dual interior-point method (Mehrotra's predictor-corrector, Nocedal and Wright chapter 16), the rows as
+slack rows G y + s = b, s >= 0 with a multiplier lam >= 0 each, and the steps ours: a step is one exact factorisation of
+H + G' diag(lam / s) G (a sparse LDL' by QDLDL on an AMD ordering: earthfast's SparseLdl, the pair Clarabel carries for the kernel,
+deterministic: no threads, one order of operations) and two solves with it. It runs on the problem the zero-weight cycles of the
+constraint graph leave (Reduced): the edges that are tight at stage 4's potentials and close a cycle (the strongly connected pieces
+of the tight edges) fix their nodes' heights relative to each other whatever the objective (a joint's equality, a held point, a
+box that has met its floor), so each such piece is one variable and an offset, the rows inside it are constants, and what remains
+has an interior. Measured: Nanpu's system 0 (78 382 samples, 152 832 edges, 76 082 curve rows) reduces to 62 243 variables and
+406 774 rows and takes 90 steps and 16 s (the kernel's 12 s). The first version of this stage was an ADMM, a first-order method whose
+residuals fall by a fraction a sweep, so a tolerance a thousand times smaller costs a thousand times the sweeps whatever solves the
+linear system: with conjugate gradients it took 658 s and stopped at its cap with 0.035 m of violation, and with this exact solve it
+ran 50 000 sweeps in 1247 s and stopped at 0.015 m. The multipliers of the equalities, which the first-order iteration has to find
+by sweeping, are what the Newton steps find at once. The start is Mehrotra's (section 16.6), infeasible; the primal residual
+reaches rounding (1e-14 m).
 
-    solve (H + sigma I + A' diag(rho) A) x~ = sigma x + h + A'(rho z - y)       z~ = A x~
-    x <- a x~ + (1 - a) x      z <- clip(a z~ + (1 - a) z + y / rho, l, u)       y <- y + rho (a z~ + (1 - a) z - z)
+Convergence: the objective is strictly convex (W_MIN) and the rows' set closed and convex with an interior once the pinned pieces
+are contracted; stage 4 says it is not empty. What the code reports is the residuals it stopped on.
 
-Convergence is a theorem, not a hope: the objective is strictly convex (W_MIN) and the rows' set closed convex and, as the system is
-feasible (stage 4: no negative cycle, and the potentials it found are the start), the two-block ADMM converges for every rho > 0
-and relaxation a in (0, 2): the primal residual |Ax - z| and the dual one |Hx - h + A'y| go to zero and x to the one minimiser
-(Boyd et al. 2011, section 3.2). What the code reports is the residuals it stopped on, never more than that. The linear system is
-solved exactly: a sparse LDL' (QDLDL on an AMD ordering, earthfast's SparseLdl, the pair Clarabel carries for the kernel) of the
-matrix, factored once for a rho and solved by two triangular sweeps an iteration, the way OSQP's direct solver does it. The steps
-are ours; only the linear solve is a library's, and a deterministic one (no threads, one order of operations). The first version
-solved it by conjugate gradients with the banded part of the matrix as the preconditioner: the rows between pieces (joints,
-clearances, overlaps) left about 35 solves a sweep of ~10 ms each in Python, and Nanpu's 78 382 samples took 658 s and stopped at the
-cap with 0.035 m of violation. A joint's equality is a row between two pieces' samples whose multiplier the iteration finds: the
-residual at the joints (stats["joint_gap_m"]) is what is left of it. rho is rescaled by the residuals' balance (OSQP's rule) at
-most MAX_RHO times, each a new factorisation on the same ordering; the work is MAX_ITER sweeps at most, never a clock.
-
-The exact bounds: from stage 4's graph the tightest height each node can have (shortest paths from the zero node, forward for the
-ceiling, backward for the floor: Bellman-Ford with a queue, the graph has no negative cycle) are the box rows' bounds (the set of
-feasible heights is unchanged by tightening a box with what the constraints already imply), and the potentials stage 4 found,
-heights that satisfy every constraint, are where the iteration starts.
-
-Stopping: the primal residual under TOL_M and the dual one under DUAL_ABS (a force, not a share of the forces: the objective's flat
-directions weigh W_MIN, so a dual residual r is a height error of up to r / (2 W_MIN) there; DUAL_ABS 1e-4 is 5 cm per sample, and a
-share of the forces let Popoli's tubes stop 14 m from the kernel's), or MAX_ITER. The
-constraint violation of the answer itself is measured, edge by edge (stats["violation_m"]): where it is over VIOLATION_M the answer
-is not given as converged."""
+Stopping: the primal residual under PRIMAL_M, the dual one under DUAL_ABS (a force, not a share of the forces: the objective's flat
+directions weigh W_MIN, so a dual residual r is a height error of up to r / (2 W_MIN) there; DUAL_ABS 1e-5 is 5 mm per sample, and the
+rounding of the late steps keeps it from going under about 2e-6 at Nanpu) and the mean complementarity under GAP_ABS; or MAX_ITER
+steps, or a factorisation that rounding took to a zero pivot. The constraint violation of the answer itself is measured, edge by
+edge (stats["violation_m"]): where it is over VIOLATION_M the answer is not given as converged."""
 import math
-from collections import deque
 
 import numpy as np
 
@@ -63,50 +57,16 @@ import interchange_audit as ia
 import staged_feasible as s4
 import staged_ground as s3
 
-TOL_M = 5e-4            # m: the iteration stops when no row is further than this from its bounds (and the dual residual is small)
 VIOLATION_M = 2e-3      # m: an answer whose worst constraint is violated by more than this is not given as converged
-MAX_ITER = 50000        # sweeps at most (the work is bounded by this, never by a clock). The sweeps are first order: Perth's six-piece system needs
-#                         10 330 of them to the kernel's answer (0.3 mm), an exact solve each, whatever rho (tried 25 to 2 500, rescaled every 25 to 100)
-MAX_RHO = 12            # rescalings of rho at most
-RHO0 = 10.0
-RHO_EQ = 1.0
-SIGMA = 1e-6
-DUAL_ABS = 1e-4
-ALPHA = 1.6             # over-relaxation (Boyd 3.4.3: any value in (0, 2) keeps the convergence)
+MAX_ITER = 200          # interior-point steps at most (a count, never a clock)
+PRIMAL_M = 1e-6         # m: no row is further than this from its bounds
+DUAL_ABS = 1e-5         # the dual residual (a force)
+GAP_ABS = 1e-8          # the mean complementarity
+TIGHT_M = 1e-6          # m: an edge this near its potentials' difference is on a zero-weight cycle's candidates (stage 4's contradiction)
+STEP_FRACTION = 0.99    # of the way to a slack or a multiplier reaching zero
 W_MIN = 1e-3            # least weight of a sample on its target: the kernel's (carriageway_solver.rs W_MIN), the strictly convex part
 CURVE_MIN_GAP_M = 0.5   # m: the least spacing a segment's own `ds` gives (carriageways.MIN_SEGMENT_M)
-RHO_EVERY = 25         # sweeps between looks at the residuals' balance
-
-
-def implied_bounds(g):
-    """(floor, ceiling) per node of g (a Graph with no negative cycle): the tightest heights the difference constraints leave a node
-    with, relative to the zero node: ceiling_v = shortest path zero -> v, floor_v = - shortest path v -> zero. Lists of g.n."""
-    n, Z = g.n, g.zero
-    rev = [[] for _ in range(n)]
-    for k, v in enumerate(g.ev):
-        rev[v].append(k)
-
-    def spfa(source, edges_at, other, forward):
-        dist = [math.inf] * n
-        dist[source] = 0.0
-        queue, inq = deque([source]), [False] * n
-        inq[source] = True
-        while queue:
-            u = queue.popleft()
-            inq[u] = False
-            du = dist[u]
-            for k in edges_at[u]:
-                v = other[k]
-                nd = du + g.ew[k]
-                if nd < dist[v] - ia.EPS_M:
-                    dist[v] = nd
-                    if not inq[v]:
-                        inq[v] = True
-                        queue.append(v)
-        return dist
-    up = spfa(Z, g.adj, g.ev, True)
-    down = spfa(Z, rev, g.eu, False)
-    return [-d for d in down], up
+TRACE = None           # a list: ipm appends (step, primal residual, dual residual, mean complementarity) (a measurement's, nothing reads it)
 
 
 class Problem:
@@ -238,61 +198,223 @@ def _bandmul(d, e, f, v):
     return out
 
 
-class Kkt:
-    """The sweeps' matrix H + sigma I + A' diag(rho) A as the upper triangle of a CSC matrix, its structure made once and its values
-    for any rho by one weighted sum (the same entries in the same order, so the same bits), and its factors: earthfast's SparseLdl
-    (QDLDL on an AMD ordering, the kernel's own pair), made at the first rho and redone on the same ordering at each new one. The
-    rows of A: the edges (z_b - z_a), the boxes (z_k), the curve windows (three entries wide)."""
+def _classes(n, eu, ev):
+    """The strongly connected components of the directed graph on n nodes with the edges eu -> ev (Tarjan, iterative, in index
+    order: the same labels everywhere): (label per node, number of components)."""
+    adj = [[] for _ in range(n)]
+    for u, v in zip(eu.tolist(), ev.tolist()):
+        adj[u].append(v)
+    index = [-1] * n
+    low = [0] * n
+    on = [False] * n
+    comp = [-1] * n
+    stack = []
+    count = nc = 0
+    for root in range(n):
+        if index[root] != -1:
+            continue
+        index[root] = low[root] = count
+        count += 1
+        stack.append(root)
+        on[root] = True
+        work = [[root, 0]]
+        while work:
+            top = work[-1]
+            v = top[0]
+            if top[1] < len(adj[v]):
+                w = adj[v][top[1]]
+                top[1] += 1
+                if index[w] == -1:
+                    index[w] = low[w] = count
+                    count += 1
+                    stack.append(w)
+                    on[w] = True
+                    work.append([w, 0])
+                elif on[w]:
+                    low[v] = min(low[v], index[w])
+            else:
+                work.pop()
+                if work:
+                    u = work[-1][0]
+                    low[u] = min(low[u], low[v])
+                if low[v] == index[v]:
+                    while True:
+                        w = stack.pop()
+                        on[w] = False
+                        comp[w] = nc
+                        if w == v:
+                            break
+                    nc += 1
+    return np.array(comp, np.int64), nc
 
-    def __init__(self, P, bn, c0, c1, c2):
+
+class Reduced:
+    """The problem on what is free. A zero-weight cycle of the constraint graph (the edges that are tight at stage 4's potentials, and
+    the strongly connected pieces they make) fixes the heights of its nodes relative to each other, whatever the objective: a
+    joint's equality, a held point, a box that meets its floor. Those nodes are one variable and an offset (x = xbase + T y, T
+    taking a node to its class's variable, the zero node's class no variable at all), the rows between a class's own nodes are
+    constants and drop out, and what is left has an interior: every row a variable has can have slack. min 1/2 y'Hy + g'y such that
+    G y <= b, the rows of G at most three entries wide (an edge's two, a box's one, a curve window's three)."""
+
+    def __init__(self, P, z0):
+        g = P.cons.g
         N = P.N
-        m1, m2, m3 = len(P.A), len(bn), len(P.K0)
-        self.N = N
-        const = m1 + m2 + m3            # (the source row of the entries that do not scale with a row's rho)
+        assert g.zero == N
+        eu = np.asarray(g.eu, np.int64)
+        ev = np.asarray(g.ev, np.int64)
+        ew = np.asarray(g.ew, np.float64)
+        d = np.append(np.asarray(z0, np.float64), 0.0)
+        tight = ew + d[eu] - d[ev] <= TIGHT_M
+        comp, nc = _classes(N + 1, eu[tight], ev[tight])
+        first = np.full(nc, N, np.int64)
+        np.minimum.at(first, comp, np.arange(N + 1, dtype=np.int64))
+        first[comp[N]] = N                      # (the zero node is its class's reference: xbase is its height there)
+        self.xbase = d - d[first[comp]]
+        free = np.ones(nc, bool)
+        free[comp[N]] = False
+        vid = np.cumsum(free) - 1
+        vid[~free] = -1
+        self.varof = vid[comp]                  # per node (the zero's last): its variable, -1 for a constant
+        self.n = n = int(free.sum())
+        self.y0 = d[first[free]]
+        self.classes = nc
+        xb, vo = self.xbase, self.varof
+        self.hrow, self.hcol, self.hval = [], [], []
+        idx = np.arange(N, dtype=np.int64)
+        chain = np.searchsorted(np.array(P.off[1:], np.int64), idx, side="right")
+        hv = np.zeros(n)
+
+        def band(i, j, val):
+            a, b = vo[i], vo[j]
+            keep = (a >= 0) & (b >= 0)
+            a, b, val = a[keep], b[keep], val[keep]
+            same = a == b
+            np.add.at(hv, a[same], 2.0 * val[same])
+            lo = np.minimum(a[~same], b[~same])
+            hi = np.maximum(a[~same], b[~same])
+            self.hrow.append(lo)
+            self.hcol.append(hi)
+            self.hval.append(val[~same])
+        keep = vo[idx] >= 0
+        np.add.at(hv, vo[idx[keep]], P.hd[idx[keep]])
+        i1 = idx[:-1][chain[:-1] == chain[1:]]
+        band(i1, i1 + 1, P.he[i1])
+        i2 = idx[:-2][chain[:-2] == chain[2:]]
+        band(i2, i2 + 2, P.hf[i2])
+        self.hdiag = hv
+        self.hrow = np.concatenate(self.hrow) if self.hrow else np.zeros(0, np.int64)
+        self.hcol = np.concatenate(self.hcol) if self.hcol else np.zeros(0, np.int64)
+        self.hval = np.concatenate(self.hval) if self.hval else np.zeros(0)
+        # the linear term of y: T'(H xbase - h)
+        pull = _bandmul(P.hd, P.he, P.hf, xb[:N]) - P.h
+        self.g = np.bincount(vo[idx[keep]], weights=pull[keep], minlength=n)
+        # the rows
+        cs, vs, lo, hi = [], [], [], []
+
+        def rows(nodes, coefs, lower, upper):
+            m = len(nodes[0])
+            c = np.zeros((m, 3), np.int64)
+            v = np.zeros((m, 3))
+            shift = np.zeros(m)
+            for j, nd in enumerate(nodes):
+                cf = np.broadcast_to(np.asarray(coefs[j], np.float64), (m,))
+                shift += cf * xb[nd]
+                var = vo[nd]
+                c[:, j] = np.where(var >= 0, var, 0)
+                v[:, j] = np.where(var >= 0, cf, 0.0)
+            live = v != 0.0
+            ref = c[np.arange(m), np.argmax(live, axis=1)]
+            same = np.all(~live | (c == ref[:, None]), axis=1)
+            dead = ~live.any(axis=1) | (same & (np.abs(v.sum(axis=1)) < 1e-12))
+            ok = ~dead
+            cs.append(c[ok])
+            vs.append(v[ok])
+            lo.append((lower - shift)[ok])
+            hi.append((upper - shift)[ok])
+        rows([P.A, P.B], [-1.0, 1.0], P.DLO, P.DHI)
+        boxed = np.flatnonzero(np.isfinite(P.lo) | np.isfinite(P.hi))
+        rows([boxed], [1.0], P.lo[boxed], P.hi[boxed])
+        if len(P.K0):
+            rows([P.K0, P.K0 + 1, P.K0 + 2], [P.CA, -(P.CA + P.CC), P.CC], -P.CB, P.CB)
+        c = np.concatenate(cs)
+        v = np.concatenate(vs)
+        lo = np.concatenate(lo)
+        hi = np.concatenate(hi)
+        up, dn = np.isfinite(hi), np.isfinite(lo)
+        self.gc = np.concatenate([c[up], c[dn]])
+        self.gv = np.concatenate([v[up], -v[dn]])
+        self.gb = np.concatenate([hi[up], -lo[dn]])
+        self.m = len(self.gb)
+        # (the entries as contiguous arrays per position in a row, with the rows that have one: the products read these)
+        self.ent = []
+        for k in range(3):
+            at = np.flatnonzero(self.gv[:, k] != 0.0)
+            self.ent.append((at, np.ascontiguousarray(self.gc[at, k]), np.ascontiguousarray(self.gv[at, k])))
+
+    def Hmul(self, y):
+        out = self.hdiag * y
+        out += np.bincount(self.hrow, weights=self.hval * y[self.hcol], minlength=self.n)
+        out += np.bincount(self.hcol, weights=self.hval * y[self.hrow], minlength=self.n)
+        return out
+
+    def Gmul(self, y):
+        out = np.zeros(self.m)
+        for at, c, v in self.ent:
+            out[at] += v * y[c]
+        return out
+
+    def Gt(self, w):
+        out = np.zeros(self.n)
+        for at, c, v in self.ent:
+            out += np.bincount(c, weights=v * w[at], minlength=self.n)
+        return out
+
+    def full(self, y, N):
+        """The heights of the N nodes for the variables y."""
+        vo = self.varof[:N]
+        return self.xbase[:N] + np.where(vo >= 0, y[np.where(vo >= 0, vo, 0)], 0.0)
+
+
+class Normal:
+    """H + G' diag(d) G as the upper triangle of a CSC matrix: its structure made once (the entries of H, then the pairs of a row of
+    G, three entries wide) and its values for any d by one weighted sum, so the same bits for the same d; its factors:
+    earthfast's SparseLdl (QDLDL on an AMD ordering, the kernel's own pair), made at the first d and redone on the same ordering
+    at each new one."""
+
+    def __init__(self, R):
+        n, m = R.n, R.m
         rows, cols, coef, src = [], [], [], []
 
         def add(r, c, w, s):
-            r = np.asarray(r, np.int64)
-            rows.append(r)
+            rows.append(np.asarray(r, np.int64))
             cols.append(np.asarray(c, np.int64))
-            coef.append(np.broadcast_to(np.asarray(w, np.float64), r.shape))
-            src.append(np.broadcast_to(np.asarray(s, np.int64), r.shape))
-        idx = np.arange(N, dtype=np.int64)
-        chain = np.searchsorted(np.array(P.off[1:], np.int64), idx, side="right")
-        add(idx, idx, P.hd + SIGMA, const)
-        i1 = idx[:-1][chain[:-1] == chain[1:]]
-        add(i1, i1 + 1, P.he[i1], const)
-        i2 = idx[:-2][chain[:-2] == chain[2:]]
-        add(i2, i2 + 2, P.hf[i2], const)
-        re = np.arange(m1, dtype=np.int64)
-        add(P.A, P.A, 1.0, re)
-        add(P.B, P.B, 1.0, re)
-        add(P.A, P.B, -1.0, re)             # (A < B: the upper triangle's row A of column B)
-        add(bn, bn, 1.0, m1 + np.arange(m2, dtype=np.int64))
-        if m3:
-            K0 = P.K0
-            rc = m1 + m2 + np.arange(m3, dtype=np.int64)
-            add(K0, K0, c0 * c0, rc)
-            add(K0 + 1, K0 + 1, c1 * c1, rc)
-            add(K0 + 2, K0 + 2, c2 * c2, rc)
-            add(K0, K0 + 1, c0 * c1, rc)
-            add(K0 + 1, K0 + 2, c1 * c2, rc)
-            add(K0, K0 + 2, c0 * c2, rc)
-        key = np.concatenate(cols) * N + np.concatenate(rows)
-        uniq, self.inv = np.unique(key, return_inverse=True)
-        self.inv = self.inv.reshape(-1)
+            coef.append(np.asarray(w, np.float64))
+            src.append(np.asarray(s, np.int64))
+        idx = np.arange(n, dtype=np.int64)
+        add(idx, idx, R.hdiag, np.full(n, m))
+        add(R.hrow, R.hcol, R.hval, np.full(len(R.hrow), m))
+        r = np.arange(m, dtype=np.int64)
+        for k in range(3):
+            for l in range(k, 3):
+                w = R.gv[:, k] * R.gv[:, l] * np.where((k < l) & (R.gc[:, k] == R.gc[:, l]), 2.0, 1.0)
+                live = w != 0.0
+                a, b = R.gc[:, k][live], R.gc[:, l][live]
+                add(np.minimum(a, b), np.maximum(a, b), w[live], r[live])
+        key = np.concatenate(cols) * n + np.concatenate(rows)
+        uniq, inv = np.unique(key, return_inverse=True)
+        self.inv = inv.reshape(-1)
         self.coef = np.concatenate(coef)
         self.src = np.concatenate(src)
-        self.indices = uniq % N
-        self.indptr = np.concatenate([[0], np.cumsum(np.bincount(uniq // N, minlength=N))]).astype(np.int64)
+        self.indices = uniq % n
+        self.indptr = np.concatenate([[0], np.cumsum(np.bincount(uniq // n, minlength=n))]).astype(np.int64)
+        self.n = n
         self.ldl = None
         self.factorisations = 0
 
-    def factor(self, rv):
-        """Factors for the rows' weights rv (rho per row of A)."""
-        vals = np.bincount(self.inv, weights=self.coef * np.append(rv, 1.0)[self.src], minlength=len(self.indices))
+    def factor(self, dvec):
+        vals = np.bincount(self.inv, weights=self.coef * np.append(dvec, 1.0)[self.src], minlength=len(self.indices))
         if self.ldl is None:
-            self.ldl = fast.sparse_ldl(self.N, self.indptr, self.indices, vals)
+            self.ldl = fast.sparse_ldl(self.n, self.indptr, self.indices, vals)
         else:
             self.ldl.refactor(vals)
         self.factorisations += 1
@@ -301,83 +423,90 @@ class Kkt:
         return self.ldl.solve(rhs)
 
 
-def admm(P, z0, max_iter=MAX_ITER):
-    """ADMM on the problem as OSQP has it (Stellato et al. 2020): minimise 1/2 x'Hx - h'x such that l <= Ax <= u, the rows of A the
-    edges' differences, the boxes and the curve windows. Each sweep: solve (H + sigma I + A' diag(rho) A) x~ = sigma x + h + A'(rho z - y)
-    exactly (a sparse LDL' on a fill-reducing ordering, factored once for a rho: Kkt), z~ = A x~, the relaxed (alpha) averages,
-    z <- the relaxed z + y/rho clipped to [l, u], y <- y + rho (relaxed z - z). Convergence: for every rho > 0 the residuals go to
-    zero and x to the minimiser (Boyd et al. 2011, section 3.2; the objective is strictly convex by W_MIN, the sets closed convex).
-    (z, stats)."""
+def _step(s, ds, lam, dlam):
+    """The longest step in (0, 1] that keeps s and lam positive."""
+    a = 1.0
+    neg = ds < 0.0
+    if neg.any():
+        a = min(a, float((-s[neg] / ds[neg]).min()))
+    neg = dlam < 0.0
+    if neg.any():
+        a = min(a, float((-lam[neg] / dlam[neg]).min()))
+    return a
+
+
+def ipm(P, z0, max_iter=MAX_ITER):
+    """The primal-dual interior-point method (Mehrotra's predictor-corrector, the textbook's: Nocedal and Wright, chapter 16, with
+    the slacks of a quadratic program) on the problem Reduced makes of P: min 1/2 y'Hy + g'y such that Gy + s = b, s >= 0, with the
+    multipliers lam >= 0 and s_i lam_i = sigma mu. A step is one factorisation of H + G' diag(lam / s) G and two solves with it,
+    the affine direction and the corrected one, and the steps are ours. The answer to stats: the primal residual (the most a row is
+    over), the dual one (a force), the mean complementarity. (z, stats)."""
     N = P.N
-    A, B = P.A, P.B
-    floor, ceil = implied_bounds(P.cons.g)
-    lo = np.maximum(P.lo, np.array(floor[:N], np.float64))
-    hi = np.minimum(P.hi, np.array(ceil[:N], np.float64))
-    bn = np.flatnonzero(np.isfinite(lo) | np.isfinite(hi))
-    m1, m2, m3 = len(A), len(bn), len(P.K0)
-    K0 = P.K0
-    K1, K2 = K0 + 1, K0 + 2
-    c0, c1, c2 = P.CA, -(P.CA + P.CC), P.CC
-
-    def Cmul(v):
-        return c0 * v[K0] + c1 * v[K1] + c2 * v[K2]
-    Lw = np.r_[P.DLO, lo[bn], -P.CB]
-    Uw = np.r_[P.DHI, hi[bn], P.CB]
-    eq = (Uw - Lw) <= 1e-9
-    x = np.clip(np.asarray(z0, np.float64), lo, hi)
-    Ax = np.r_[x[B] - x[A], x[bn], Cmul(x)]
-    z = np.minimum(np.maximum(Ax, Lw), Uw)
-    y = np.zeros(m1 + m2 + m3)
-    rho = RHO0
-    kkt = Kkt(P, bn, c0, c1, c2)
-
-    def factor(rho):
-        rv = np.where(eq, RHO_EQ * rho, rho)
-        kkt.factor(rv)
-        return rv
-
-    def Aty(w):
-        out = np.bincount(B, weights=w[:m1], minlength=N) - np.bincount(A, weights=w[:m1], minlength=N) + np.bincount(bn, weights=w[m1:m1 + m2], minlength=N)
-        if m3:
-            wc = w[m1 + m2:]
-            out = out + np.bincount(K0, weights=wc * c0, minlength=N) + np.bincount(K1, weights=wc * c1, minlength=N) + np.bincount(K2, weights=wc * c2, minlength=N)
-        return out
-
-    rv = factor(rho)
-    rescalings = 0
-    it = 0
-    r_pri = r_dual = math.inf
+    R = Reduced(P, z0)
+    n, m = R.n, R.m
+    stats = dict(classes=R.classes, variables=n, rows=m)
+    if n == 0:
+        return R.full(np.zeros(0), N), dict(stats, iterations=0, factorisations=0, primal_residual_m=0.0, dual_residual=0.0,
+                                            gap=0.0, converged=True)
+    K = Normal(R)
+    y = R.y0.copy()
+    if m == 0:
+        K.factor(np.zeros(0))
+        y = K.solve(-R.g)
+        return R.full(y, N), dict(stats, iterations=1, factorisations=1, primal_residual_m=0.0, dual_residual=0.0, gap=0.0,
+                                  converged=True)
+    # the starting point is Mehrotra's (Nocedal and Wright, section 16.6): the y with slack and multiplier equal (H + G'G y = -g - G'b),
+    # both moved to be positive and then to be of the same size, so that no product s lam starts far from the mean
+    K.factor(np.ones(m))
+    y = K.solve(-R.g - R.Gt(R.gb))
+    s = R.gb - R.Gmul(y)
+    s = s + max(-1.5 * float(s.min()), 0.0)
+    lam = s.copy()
+    lift = 0.5 * float(np.dot(s, lam)) / float(s.sum())
+    s = s + lift
+    lam = lam + lift
     converged = False
+    it = 0
+    r_pri = r_dual = gap = math.inf
     while it < max_iter:
-        it += 1
-        xt = kkt.solve(SIGMA * x + P.h + Aty(rv * z - y))
-        zt = np.r_[xt[B] - xt[A], xt[bn], Cmul(xt)]
-        xr = ALPHA * xt + (1.0 - ALPHA) * x
-        zr = ALPHA * zt + (1.0 - ALPHA) * z
-        z_new = np.minimum(np.maximum(zr + y / rv, Lw), Uw)
-        y = y + rv * (zr - z_new)
-        x, z = xr, z_new
-        Ax = np.r_[x[B] - x[A], x[bn], Cmul(x)]
-        Px = _bandmul(P.hd, P.he, P.hf, x)
-        ATy = Aty(y)
-        r_pri = float(np.abs(Ax - z).max(initial=0.0))
-        r_dual = float(np.abs(Px - P.h + ATy).max(initial=0.0))
-        if r_pri <= TOL_M and r_dual <= DUAL_ABS:
+        rd = R.Hmul(y) + R.g + R.Gt(lam)
+        rp = R.Gmul(y) + s - R.gb
+        mu = float(np.dot(s, lam)) / m
+        r_pri = float(np.abs(rp).max())
+        r_dual = float(np.abs(rd).max())
+        gap = mu
+        if TRACE is not None:
+            TRACE.append((it, r_pri, r_dual, gap))
+        if r_pri <= PRIMAL_M and r_dual <= DUAL_ABS and gap <= GAP_ABS:
             converged = True
             break
-        if it % RHO_EVERY == 0 and rescalings < MAX_RHO:
-            # (OSQP's rule: rho by the square root of the ratio of the normalised residuals, when it is off by 5x)
-            pn = r_pri / max(float(np.abs(Ax).max(initial=0.0)), float(np.abs(z).max(initial=0.0)), 1e-12)
-            dn = r_dual / max(float(np.abs(Px).max(initial=0.0)), float(np.abs(ATy).max(initial=0.0)),
-                              float(np.abs(P.h).max(initial=0.0)), 1e-12)
-            ratio = math.sqrt(pn / max(dn, 1e-30))
-            if ratio > 5.0 or ratio < 0.2:
-                rho = min(max(rho * ratio, 1e-6), 1e8)
-                rv = factor(rho)
-                rescalings += 1
-    stats = dict(iterations=it, factorisations=kkt.factorisations, rho=rho, rho_rescalings=rescalings, primal_residual_m=r_pri,
-                 dual_residual=r_dual, converged=converged)
-    return x, stats
+        it += 1
+        try:
+            K.factor(lam / s)
+        except ValueError as e:
+            # (a pivot that rounding took to zero: the matrix's entries span 1e13 as the slacks close; what the iteration reached is
+            # what it reports, not converged)
+            stats["factor_error"] = str(e)
+            break
+
+        def direction(rc):
+            dy = K.solve(-rd - R.Gt((lam * rp - rc) / s))
+            ds = -rp - R.Gmul(dy)
+            dl = (-rc - lam * ds) / s
+            return dy, ds, dl
+        dy, ds, dl = direction(s * lam)
+        a = _step(s, ds, lam, dl)
+        mu_aff = float(np.dot(s + a * ds, lam + a * dl)) / m
+        r = mu_aff / mu
+        sigma = r * r * r
+        dy, ds, dl = direction(s * lam + ds * dl - sigma * mu)
+        a = STEP_FRACTION * _step(s, ds, lam, dl)
+        y = y + a * dy
+        s = s + a * ds
+        lam = lam + a * dl
+    stats.update(iterations=it, factorisations=K.factorisations, primal_residual_m=r_pri, dual_residual=r_dual, gap=gap,
+                 converged=converged, fill=int(K.ldl.nnz_l) if K.ldl is not None else 0)
+    return R.full(y, N), stats
 
 
 def constraints_of(net, sysm, pcs, smp, gl, fixed_z, at=None, spacing="true"):
@@ -411,7 +540,7 @@ def solve_constraints(cons):
         dist = [0.0] * g.n
     z0 = np.array([dist[v] - dist[g.zero] for v in range(g.n - 1)], np.float64)
     P = Problem(cons)
-    z, st = admm(P, z0)
+    z, st = ipm(P, z0)
     viol, kinds = P.violation(z)
     H.zs = [z[P.off[c]:P.off[c + 1]].copy() for c in range(len(cons.chains))]
     st.update(feasible=True, nodes=P.N, edges=len(P.A), boxes=int(np.count_nonzero(np.isfinite(P.lo) | np.isfinite(P.hi))),
