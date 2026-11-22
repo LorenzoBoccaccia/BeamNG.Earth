@@ -1505,6 +1505,15 @@ def _onward(net, j, s_from, toward_end):
     return segs + (walk(net, j, False, left) if left > 1e-6 else [])
 
 
+def approach_xy(net, j, s_from, toward_end, length, step):
+    """The points every step m along the road j from arc length s_from on, away from the shape (_onward: through its
+    joints), length m at most (k, 2). Pure."""
+    x = sample(net, [dict(segs=_onward(net, j, s_from, toward_end))])[0]
+    d = np.asarray(x["d"], np.float64)
+    q = np.arange(0.0, min(float(length), float(d[-1])) + 1e-9, float(step))
+    return np.stack([np.interp(q, d, x["xy"][:, 0]), np.interp(q, d, x["xy"][:, 1])], axis=1)
+
+
 def _split(net, x, z, k_end, mode, out):
     """A ramp's or dip's samples (x from sample()) up to k_end, per member: out[member] += (s ascending, z, mode)."""
     mem, ms = x["mem"][:k_end], x["ms"][:k_end]
@@ -1522,11 +1531,12 @@ def _split(net, x, z, k_end, mode, out):
         out.setdefault(int(j), []).append((sv[o], zv[o], mode))
 
 
-def embankments(net, systems, shapes, ground_along):
+def embankments(net, systems, shapes, ground_along, abutment=None):
     """The roads' heights round the shapes: per member, [(s (m,), z (m,), mode)] with mode "fill" (the plan rises to
     it: an embankment), "cut" (the plan goes down to it) or "set" (the plan takes it: a road between two shapes whose
     ramps meet before the ground does, lerped). shapes: per system (pieces, samples, heights);
-    ground_along(member, s) -> ground heights."""
+    ground_along(member, s) -> ground heights; abutment(z, step), when given, the ground a deck's end meets along the road
+    going on from it (z every step m from the end: grading.fill_abutment, the plans' own read of it)."""
     ramps = []              # (first member, s0, direction +1/-1, z0, samples, z, touch index, sign)
     out = {}
     for sysm, (pcs, smp, zs) in zip(systems, shapes):
@@ -1541,7 +1551,7 @@ def embankments(net, systems, shapes, ground_along):
             g = (z[b] - z[a]) / max(dd[b] - dd[a], 1e-6)
             return float(zz), float(g)
 
-        def ramp_from(j, s0, toward_end, z0, g_along):
+        def ramp_from(j, s0, toward_end, z0, g_along, deck_end=False):
             segs = _onward(net, j, s0, toward_end)
             x = sample(net, [dict(segs=segs)])[0]
             mem = np.asarray(x["mem"])
@@ -1549,6 +1559,8 @@ def embankments(net, systems, shapes, ground_along):
             for m_ in np.unique(mem):               # (each member's ground in one read, not a read a sample)
                 sel = mem == m_
                 gr[sel] = ground_along(int(m_), np.asarray(x["ms"])[sel])
+            if deck_end and abutment is not None and len(gr) > 2:
+                gr = np.asarray(abutment(gr, float(np.median(np.diff(x["d"])))), np.float64)
             sign = 1.0 if z0 >= gr[0] else -1.0
             z, k = ramp(z0, g_along, sign, max_grade(net.m[j]), curve_radius(net.m[j]), x["d"] - x["d"][0], gr)
             ramps.append((j, s0, 1 if toward_end else -1, z0, x, z, k, sign))
@@ -1561,7 +1573,7 @@ def embankments(net, systems, shapes, ground_along):
             if z0 is None:
                 continue
             leaving = -g if si < net.L[i] / 2 else g        # (the deck's grade on the way out of it)
-            ramp_from(j, sj, sj < net.L[j] / 2, z0, leaving)
+            ramp_from(j, sj, sj < net.L[j] / 2, z0, leaving, deck_end=True)
         # a road going under: its dip (cut), and on from its ends if they are not back on the ground
         for pc, x, z in zip(pcs, smp, zs):
             if pc["kind"] != "dip":

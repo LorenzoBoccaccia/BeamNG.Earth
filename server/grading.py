@@ -4681,6 +4681,41 @@ class _Planner:
             raw = smooth_profile(median_profile(raw, _gsh.STEP_M, 12.0), _gsh.STEP_M, 6.0)
         return raw
 
+    def _abutment_ground(self, net, sysm, pcs, smp, ground):
+        """ground (per piece, along it: _ground_line's) with each deck's end on a road on the ground read as that road's
+        approach is (fill_abutment, ABUT_FILL_ON): the embankment's top where the deck's line ends down the slope short
+        of its abutment. The plans' roads leading onto a bridge and the underpasses' decks (_end_filled) read it so; the
+        shape took the elevation at the line's end, so a deck's natural height ran down to it: the Boulevard Peripherique's
+        slab at Porte Maillot (48.8798 N 2.2813 E: the map's bridge ends 11 m short of it, the lidar terrain has the slab
+        out there, 30.7 m where the street is 37.7) came down 7 m to its end with the road after it, and the road under
+        it at its own 37.7 asked 31 to 32 m of cover over a tube it could not give. Changed in place."""
+        if not ABUT_FILL_ON:
+            return
+        f64 = np.float64
+        piece = {pc["main"]: p for p, pc in enumerate(pcs) if pc["kind"] == "deck"}
+        for i, si, j, sj in sysm["ends"]:
+            p = piece.get(i)
+            if p is None or net.m[i].kind != "deck" or min(sj, net.L[j] - sj) > APPROACH_TOUCH_M:
+                continue            # (a road leads onto a bridge by its end: _abut_ends)
+            xy = _gsh.approach_xy(net, j, sj, sj < net.L[j] / 2, ABUT_FAR_M, PROFILE_STEP)
+            if len(xy) < 5:
+                continue
+            la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
+            try:
+                z = np.asarray(self.elev(np.asarray(la, f64), np.asarray(lo, f64)), f64).reshape(-1)
+            except Exception as e:      # (the approach's ground unread: the deck's end as it was)
+                _caught(e)
+                log.debug("grading: approach of %s: %s: %s", np.round(xy[0]), type(e).__name__, e)
+                continue
+            if not np.isfinite(z).all():
+                continue
+            x = smp[p]
+            on = np.flatnonzero(np.asarray(x["mem"]) == i)
+            if not len(on):
+                continue
+            k = int(on[np.argmin(np.abs(np.asarray(x["ms"], f64)[on] - si))])
+            ground[p][k] = max(float(ground[p][k]), float(fill_abutment(z, False)[0]))
+
     def _track_bed(self, xy, fid=None):
         """The railways' bed (n,) at points xy (n, 2) on a track's line (of line fid only, when given), in the DEM's
         heights: railways.track_beds round them, the bed grade_plans lays the ground to and tile_mesh draws the track
@@ -4889,6 +4924,7 @@ class _Planner:
             else:
                 try:
                     ground = [self._ground_line(x["xy"]) for x in smp]
+                    self._abutment_ground(net, sysm, pcs, smp, ground)
                     zs = _gsh.solve_shape(net, sysm, pcs, smp, ground, fixed_z, diag)
                     with _SHAPE_SOLVE_LOCK:
                         if len(cache) >= 4096:
@@ -4915,7 +4951,7 @@ class _Planner:
             xy = np.stack([np.interp(sv, net.s[i], net.lines[i][:, 0]), np.interp(sv, net.s[i], net.lines[i][:, 1])],
                           axis=1)
             return self._ground_line(xy)
-        emb = _gsh.embankments(net, solved, shapes, ground_along)
+        emb = _gsh.embankments(net, solved, shapes, ground_along, None)
         prof = {}
         for (pcs, smp, zs) in shapes:
             for pc, x, z in zip(pcs, smp, zs):

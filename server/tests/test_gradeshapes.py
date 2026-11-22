@@ -679,3 +679,17 @@ def test_a_deck_ending_at_a_tunnels_mouth_is_where_its_structure_leaves_the_grou
     rel = {i: ix._relations(net, i) for i in range(len(m))}
     links, leave = ix._Verdicts(net, rel, lambda i: i, None).links()
     assert (1, 0) in leave and (1, 1) in leave
+
+
+def test_the_approach_of_a_road_from_a_decks_end_is_the_road_going_on_away_from_it():
+    # (grading._abutment_ground reads the ground along it: a road's approach, the points fill_abutment is asked of)
+    m = [Member("deck", _line(0, 0, 30, 0, 13), "deck", "primary", 50, 1, 4.2, None),
+         Member("road", _line(30, 0, 130, 0, 50), "ground", "primary", 50, 0, 4.2, None),
+         Member("under", _line(10, -50, 10, 50, 50), "ground", "primary", 50, 0, 4.2, None)]   # (what it spans)
+    net, systems = ix.find_systems(m)
+    j = _key_index(net, "road")
+    end = [e for e in systems[0]["ends"] if e[2] == j][0]
+    xy = ix.approach_xy(net, j, end[3], end[3] < net.L[j] / 2, 40.0, 2.0)
+    assert len(xy) == 21 and np.allclose(xy[0], [30, 0]) and np.allclose(xy[-1], [70, 0])
+    assert np.allclose(np.hypot(*np.diff(xy, axis=0).T), 2.0), "(every step m)"
+

@@ -1494,6 +1494,63 @@ class UnderpassShortfallTest(unittest.TestCase):
             self.assertLess(float(z_at([0.0], [0.0])[0]), 10.0 - 2.0, "(BNE_ABUT_FILL=off: dug as before)")
 
 
+class AbutmentGroundTest(unittest.TestCase):
+    """The ground at a deck's end on a road is read as that road's own plan reads it (fill_abutment): the embankment's top
+    where the deck's map line ends down the slope. The Boulevard Peripherique's slab at Porte Maillot (48.8798 N 2.2813 E):
+    the map's bridge ends 11 m short of the slab, and the lidar terrain model has the slab out, so the ground at the
+    bridge's end is the trench's floor, not the street. IGN LiDAR HD (2023, IGN69 heights, measured offline: the terrain
+    model and the surface model, the same Earth's elevation reads at plain ground to 0.02 m) along the road from the
+    bridge's end: floor 30.66 at the end, 30.33 at 8 m, the street 37.7 from 12 m on (the surface model: 37.6 all along
+    the slab). Nothing here reads lidar: these are its measured heights as the truth the read is held to."""
+
+    FLOOR = np.array([(0.0, 30.66), (8.0, 30.33), (10.0, 32.9), (12.0, 37.7), (200.0, 37.7)])
+
+    @staticmethod
+    def truth(xy):
+        x = np.asarray(xy, np.float64)[:, 0]
+        west = np.interp(-x, AbutmentGroundTest.FLOOR[:, 0], AbutmentGroundTest.FLOOR[:, 1])
+        return np.where(x <= 0.0, west, np.where(x < 36.0, 30.9, 37.7))     # (the span's own ground: the trench's floor)
+
+    def ends(self):
+        import gradeshapes as ix
+        from gradeshapes import Member
+        from test_gradeshapes import _fixed, _line
+        m = [Member("deck", _line(0, 0, 44, 0, 13), "deck", "primary", 50, 1, 4.2, None),
+             Member("west", _line(0, 0, -100, 0, 50), "ground", "primary", 50, 0, 4.2, None),
+             Member("east", _line(44, 0, 144, 0, 50), "ground", "primary", 50, 0, 4.2, None),
+             Member("under", _line(20, -50, 20, 50, 50), "ground", "primary", 50, 0, 4.2, None)]    # (what it spans)
+        net, systems = ix.find_systems(m, lambda net_: (self.truth, lambda i, s: _fixed(net_, self.truth, i, s)))
+        sysm = systems[0]
+        pcs = ix.pieces(net, sysm)
+        smp = ix.sample(net, pcs)
+        ground = [self.truth(x["xy"]) for x in smp]
+        p = [n for n, pc in enumerate(pcs) if pc["kind"] == "deck"][0]
+        x = smp[p]["xy"][:, 0]
+        return net, sysm, pcs, smp, ground, p, int(np.argmin(x)), int(np.argmax(x))
+
+    def read(self):
+        net, sysm, pcs, smp, ground, p, west, east = self.ends()
+
+        def elev(la, lo):
+            e, n, _ = FRAME.geodetic_to_enu(la, lo, 0.0)
+            return self.truth(np.stack([np.asarray(e), np.asarray(n)], axis=1))
+        g = types.SimpleNamespace(frame=FRAME, elev=elev)
+        before = float(ground[p][west]), float(ground[p][east])
+        grading._Planner._abutment_ground(g, net, sysm, pcs, smp, ground)
+        return before, (float(ground[p][west]), float(ground[p][east]))
+
+    def test_a_deck_end_down_the_slope_is_read_at_the_embankments_top(self):
+        before, after = self.read()
+        self.assertAlmostEqual(before[0], 30.66, delta=0.01, msg="(the lidar terrain model at the bridge's end: the floor)")
+        self.assertAlmostEqual(after[0], 37.7, delta=0.15, msg="the street, where the slab is")
+        self.assertAlmostEqual(after[1], before[1], delta=1e-9, msg="(the east end is on the street already)")
+
+    def test_off_with_the_abutment_fill(self):
+        with unittest.mock.patch.object(grading, "ABUT_FILL_ON", False):
+            before, after = self.read()
+        self.assertEqual(before, after)
+
+
 class StreetRunsTest(unittest.TestCase):
     # a street from x -60 to 60 in two pieces (the second drawn backwards) between junctions with side streets
     LINES = [np.array(ln, float) for ln in ([(-300, 0), (-60, 0)], [(-60, 0), (20, 0)], [(60, 0), (20, 0)],
