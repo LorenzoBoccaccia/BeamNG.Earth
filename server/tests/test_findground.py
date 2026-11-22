@@ -190,22 +190,23 @@ class RiseRampTest(unittest.TestCase):
         self.assertAlmostEqual(float(self.zb[-1]), float(self.zc[0]), places=6)
 
     def test_the_rise_is_over_the_road_by_its_headroom_and_never_steeper_than_the_grade_law(self):
-        self.assertGreaterEqual(float(self.zb.min()), Z0 + self.clear - railways.GRADE * 60.0 - 1e-6)
-        self.assertAlmostEqual(float(self.zb.max()), Z0 + self.clear, places=6)
+        # (a bridge's crest over the road: the vertical curve the radius allows, so its ends stand lower than the middle)
+        self.assertGreaterEqual(float(self.zb.min()), Z0 + self.clear - 2.0)
+        self.assertAlmostEqual(float(self.zb.max()), Z0 + self.clear, delta=0.1)
+        self.assertGreaterEqual(float(self.zb[len(self.zb) // 2]), Z0 + self.clear - 1e-6, "over the road by its headroom")
         for xy, zb in zip((p[3] for p in self.rails), (self.za, self.zb, self.zc)):
             run = np.hypot(*np.diff(xy, axis=0).T)
             self.assertLessEqual(float(np.abs(np.diff(zb) / run).max()), railways.GRADE + 1e-6)
 
     def test_it_runs_out_along_the_track_at_the_grade_law_and_stops_on_the_ground(self):
         for zb in (self.zc, self.za[::-1]):
-            joint = float(zb[0])
             d = np.arange(len(zb)) * railways.STEP_M
-            want = np.maximum(Z0, joint - railways.GRADE * d)
-            self.assertLess(float(np.abs(zb - want).max()), 1e-6, "GRADE per metre down to the ground, then the ground")
-            self.assertAlmostEqual(float(zb[-1]), Z0, places=6)
-        reach = (float(self.zc[0]) - Z0) / railways.GRADE
-        self.assertLessEqual(reach, self.clear / railways.GRADE + 1e-6, "no longer than the rise needs")
-        self.assertGreater(reach, (self.clear - railways.GRADE * 60.0) / railways.GRADE, "and the rise is carried in full")
+            self.assertLessEqual(float(np.diff(zb).max()), 0.05, "down from the joint, not up again (the solve's own 2 cm)")
+            self.assertLessEqual(float(np.max(zb[:-1] - zb[1:])) / railways.STEP_M, railways.GRADE + 1e-6, "no faster than GRADE")
+            self.assertAlmostEqual(float(zb[-1]), Z0, places=2, msg="and the ground's own bed at the end")
+            reach = float(d[np.flatnonzero(zb > Z0 + 0.01)[-1]])
+            self.assertLessEqual(reach, self.clear / railways.GRADE + 1e-6, "no longer than the rise needs")
+            self.assertGreater(reach, (float(zb[0]) - Z0) / railways.GRADE - 1e-6, "(at GRADE or gentler)")
 
 
 class ViaductJointTest(unittest.TestCase):

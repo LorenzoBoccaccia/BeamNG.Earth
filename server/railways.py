@@ -3,12 +3,12 @@ bed with concrete sleepers and two steel rails, and their bridges as concrete de
 road tile (write_tile's "rail"). Mapped tram bridges use the same visual/collision
 pipeline, with a narrow concrete slab and embedded rails instead of ballast and sleepers.
 
-The heights are one profile along the connected track. On the ground the bed follows the drawn ground, smoothed
-along its length (a railway does not ride every bump of the lattice). A bridge (the segment's is_bridge flag or level
-above 0) is a deck straight between the bed at its ends (deck_heights), raised only where the ground under it would
-come through, never steeper than GRADE. Where it is raised, its height reaches out along the track it joins, falling
-GRADE per metre: the approach embankments, across segment ends and tile edges alike (the lines are taken from REACH_M
-around the tile). The ballast's sides go down past the ground, a low
+The heights are one profile along the connected track: a solve under the track's grade (GRADE) and its vertical curve
+(RAIL_VERTICAL_RADIUS_M), the road laws' own kernel (railsolve), fitted to the ground under its ground parts and to nothing
+under a bridge (the segment's is_bridge flag or level above 0) or a tunnel: a deck is the track straight between where the
+terrain's weight begins, over the ground under it by at most DECK_RAISE_MAX_M, over a road to the clearance findground's
+cost law has it keep (the road dipping under it otherwise: grading's underpass). The terrain's smear (a DEM's smoothed
+embankment) is not a height the track can follow at that grade and radius: it crosses it. The ballast's sides go down past the ground, a low
 embankment on the flat and a tall one on a ramp. Short mapped road tunnels also create supported spans when the upper rail lacks a bridge tag.
 Where a road crosses at grade, the track stops either side of the
 carriageway (a level crossing: the road's own surface across it). Tunnels are left out. Pure given its inputs."""
@@ -56,13 +56,13 @@ GRADE = 0.05                # THE grade law of a track, read by everything that 
 REACH_M = 200.0             # m around a tile the lines are taken: the solve's reach beyond it and a raised deck's ramps
 RAIL_VERTICAL_RADIUS_M = 1000.0    # m: the tightest vertical curve a track's bed has, one law for every line (railsolve): where a
                             # line is in a city and where it is not is not told, so it is the tight end of the dense
-                            # places' own. Measured offline, IGN LiDAR HD (MNT on the ground, MNS on a bridge, 1 m, the
-                            # BD TOPO centrelines, tunnels left out), 17.7 km of main line in ten stations' approaches
-                            # (Paris Saint-Lazare, Est, Pleyel, Vaugirard, Austerlitz, Lyon Perrache and Part-Dieu, Marseille
-                            # Saint-Charles, Toulouse, Lille/Bordeaux), the curvature 1/R of a parabola fitted over 40 m
-                            # every 2 m: R at the 99th percentile 1700 m, at the 99.5th 1430 m, at the 99.9th 1020 m, the
-                            # tightest single crest 465 m (a window of 60 m: 3300, 2790, 2000 m). A game's concession: the
-                            # radius of the 99.9th percentile, a link road's (carriageways.LIMITS: 10-12 m a percent)
+                            # places' own. Measured offline (2026-11-19), IGN LiDAR HD (MNT on the ground, MNS on a bridge,
+                            # 1 m) along BD TOPO's main-line centrelines, tunnels left out: 17.7 km in ten stations'
+                            # approaches (Paris Saint-Lazare, Est, Pleyel, Vaugirard and Austerlitz; Lyon Perrache and
+                            # Part-Dieu; Marseille Saint-Charles; Toulouse; Bordeaux), the curvature 1/R of a parabola
+                            # fitted over 40 m every 2 m: R at the 99th percentile 1700 m, the 99.5th 1430 m, the 99.9th
+                            # 1020 m, the tightest single crest 465 m (a 60 m window: 3300, 2790, 2000 m). A game's
+                            # concession: the 99.9th percentile's, a link road's (carriageways.LIMITS: 10-12 m a percent)
 BALLAST_H = 0.3             # m of ballast over the bed line
 BALLAST_TOP_M = 1.8         # m: half the ballast's top width
 BALLAST_SLOPE = 1.5         # m out per m down on its sides

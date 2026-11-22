@@ -90,10 +90,11 @@ def chains_of(edges):
     return out, ends
 
 
-def _across(t, structure):
-    """t with each run of structure samples (a bridge's, a tunnel's) laid straight between the ground on either side: what
-    is under a deck (a valley's floor) or over a tube (the hill) is not the track's height, and the kernel keeps a small
-    weight even where there is none."""
+def _across(t, structure, s, left=None, right=None):
+    """t with each run of structure samples (a bridge's, a tunnel's) laid straight along s between the ground on either
+    side: what is under a deck (a valley's floor) or over a tube (the hill) is not the track's height, and the kernel keeps
+    a small weight even where there is none. A run at the chain's start or end is laid to left or right, the height of the
+    node there (None: the ground's own, level)."""
     t = np.asarray(t, np.float64).copy()
     n = len(t)
     i = 0
@@ -104,9 +105,14 @@ def _across(t, structure):
         j = i
         while j + 1 < n and structure[j + 1]:
             j += 1
-        a = t[i - 1] if i > 0 else (t[j + 1] if j + 1 < n else t[i])
-        b = t[j + 1] if j + 1 < n else a
-        t[i:j + 1] = a + (b - a) * (np.arange(i, j + 1) - (i - 1)) / float(j + 1 - (i - 1))
+        lo = (s[i - 1], t[i - 1]) if i > 0 else (s[0], left) if left is not None else None
+        hi = (s[j + 1], t[j + 1]) if j + 1 < n else (s[-1], right) if right is not None else None
+        if lo is None and hi is None:
+            pass
+        elif lo is None or hi is None or hi[0] <= lo[0]:
+            t[i:j + 1] = (lo or hi)[1]
+        else:
+            t[i:j + 1] = lo[1] + (hi[1] - lo[1]) * (s[i:j + 1] - lo[0]) / (hi[0] - lo[0])
         i = j + 1
     return t
 
@@ -140,8 +146,12 @@ class Track:
             marks = np.r_[s[cut], s[cut + 1]] if len(cut) else np.zeros(0)
             from_end = np.min(np.abs(s[:, None] - marks[None, :]), axis=1) if len(marks) else np.full(len(s), np.inf)
             w = carriageways.weights(st, from_end, TRUST_M) * GROUND_W
-            w[[0, -1]] = ANCHOR_W
-            self.chains.append(dict(xy=xy, s=s, t=_across(np.concatenate(ts), st), w=w, structure=st, ds=np.diff(s)))
+            self.chains.append(dict(xy=xy, s=s, t=np.concatenate(ts), w=w, structure=st, ds=np.diff(s)))
+        self._laid_across(ends)
+        for node, hits in ends.items():             # (a loose end of the line is held to the terrain there, and so is an end on
+            for c, e in hits:                       # the ground where chains meet: not one inside a structure, a switch on a viaduct)
+                if len(hits) == 1 or not self.chains[c]["structure"][-1 if e else 0]:
+                    self.chains[c]["w"][-1 if e else 0] = ANCHOR_W
         self.couplings = []
         for node, hits in ends.items():             # (the chains that end at one node are one height there)
             for (a, ea), (b, eb) in zip(hits[:-1], hits[1:]):
@@ -151,6 +161,77 @@ class Track:
         for na, ia, nb, j in carriageways.branch_ties([c["xy"] for c in self.chains], [c["structure"] for c in self.chains],
                                                        JOIN_M):
             self.couplings.append((na, ia, nb, j, "eq", 0.0))
+
+    def _laid_across(self, ends):
+        """Each run of structure is laid straight between the heights at its two ends (_across). The nodes inside a structure
+        (a viaduct's switches: every chain that meets there ends on its deck, and the terrain there is what the deck
+        crosses) have no height of their own and take the one that leaves the lines straight, the mean of their neighbours'
+        weighted by the length of line between (a string's): the neighbours the ground at the far end of each run, a
+        node on the ground (the terrain's), or a loose end (the terrain's too). A ground chain's own bridge ends in such
+        a node as the viaduct's lines do, so a viaduct's switch and a bridge's end are one law."""
+        height, fixed, link = {}, {}, []                    # node -> z; node -> [(z, length)]; [(node, node, length)]
+        nodes = {}
+        for node, hits in ends.items():
+            for c, e in hits:
+                nodes[(c, e)] = node
+        for node, hits in ends.items():
+            on = [self.chains[c]["t"][-1 if e else 0] for c, e in hits if not self.chains[c]["structure"][-1 if e else 0]]
+            if on:
+                height[node] = float(np.mean(on))
+            elif len(hits) == 1:                            # (a loose end inside a structure: the terrain there)
+                c, e = hits[0]
+                height[node] = float(self.chains[c]["t"][-1 if e else 0])
+        for (c, e), node in nodes.items():
+            ch = self.chains[c]
+            st = ch["structure"]
+            if not st[-1 if e else 0] or node in height:
+                continue
+            ground = np.flatnonzero(~st)
+            if not len(ground):
+                if e == 0:                                  # (a run of structure alone, to its other end: once)
+                    other = nodes[(c, 1)]
+                    if other != node:
+                        link.append((node, other, float(ch["s"][-1])))
+                continue
+            k = int(ground[0]) if e == 0 else int(ground[-1])
+            d = float(abs(ch["s"][k] - ch["s"][-1 if e else 0]))
+            fixed.setdefault(node, []).append((float(ch["t"][k]), max(d, 1.0)))
+        unknown = sorted({n for n in nodes.values() if n not in height}, key=str)
+        reach = {n for n in unknown if n in fixed}
+        grew = True
+        while grew:
+            grew = False
+            for u, v, _d in link:
+                if (u in reach) != (v in reach) and u not in height and v not in height:
+                    reach |= {u, v}
+                    grew = True
+        reach |= {n for u, v, _d in link for n in (u, v) if n not in height and (u in height or v in height)}
+        unknown = [n for n in unknown if n in reach]
+        if unknown:
+            row = {node: i for i, node in enumerate(unknown)}
+            m = np.zeros((len(unknown), len(unknown)))
+            b = np.zeros(len(unknown))
+            for node, hits in fixed.items():
+                if node in row:
+                    for z, d in hits:
+                        m[row[node], row[node]] += 1.0 / d
+                        b[row[node]] += z / d
+            for u, v, d in link:
+                g = 1.0 / max(d, 1.0)
+                for x, y in ((u, v), (v, u)):
+                    if x not in row:
+                        continue
+                    m[row[x], row[x]] += g
+                    if y in row:
+                        m[row[x], row[y]] -= g
+                    elif y in height:
+                        b[row[x]] += g * height[y]
+            for node, z in zip(unknown, dnp.solve(m, b)):
+                height[node] = float(z)
+        for c, ch in enumerate(self.chains):
+            left = height.get(nodes[(c, 0)]) if ch["structure"][0] else None
+            right = height.get(nodes[(c, 1)]) if ch["structure"][-1] else None
+            ch["t"] = _across(ch["t"], ch["structure"], ch["s"], left, right)
 
     def solve(self, lo=None):
         """Per part, its heights (k,): lo {part: (k,) lower bounds, -inf where none} the clearances kept."""
